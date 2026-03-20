@@ -1183,6 +1183,10 @@ public:
         {
             offsets_[path] = 0;
         }
+        if ( sourceEpisodes_.find( path ) == sourceEpisodes_.end() )
+        {
+            sourceEpisodes_[path] = 0;
+        }
     }
 
     long long OffsetFor( std::string const & path ) const
@@ -1198,6 +1202,11 @@ public:
     void SetOffset( std::string const & path, long long offset )
     {
         offsets_[path] = offset < 0 ? 0 : offset;
+    }
+
+    void AddSourceEpisodes( std::string const & path, unsigned int episodes )
+    {
+        sourceEpisodes_[path] += episodes;
     }
 
     void RecordEpisode( bool survived, REAL distance, REAL reward, REAL averagePredictedValue, unsigned int steps, bool learned )
@@ -1360,6 +1369,13 @@ public:
                 in >> path >> offset;
                 offsets_[path] = offset;
             }
+            else if ( key == "source_episodes" )
+            {
+                std::string path;
+                unsigned long long episodes = 0;
+                in >> path >> episodes;
+                sourceEpisodes_[path] = episodes;
+            }
         }
 
         return !in.fail();
@@ -1399,6 +1415,10 @@ public:
         {
             out << "source " << it->first << " " << it->second << "\n";
         }
+        for ( std::map< std::string, unsigned long long >::const_iterator it = sourceEpisodes_.begin(); it != sourceEpisodes_.end(); ++it )
+        {
+            out << "source_episodes " << it->first << " " << it->second << "\n";
+        }
     }
 
 private:
@@ -1415,6 +1435,7 @@ private:
     unsigned int lastSteps_;
     bool lastLearned_;
     std::map< std::string, long long > offsets_;
+    std::map< std::string, unsigned long long > sourceEpisodes_;
 };
 
 static bool OfflineMetricsNeedsHeader()
@@ -1704,6 +1725,7 @@ static unsigned int TrainOfflineSource( std::string const & path, OfflineTrainer
         ++trainedEpisodes;
     }
 
+    state.AddSourceEpisodes( path, trainedEpisodes );
     state.SetOffset( path, size );
     return trainedEpisodes;
 }

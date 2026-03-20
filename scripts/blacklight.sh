@@ -13,6 +13,9 @@ Usage:
   ./scripts/blacklight.sh train [options]
   ./scripts/blacklight.sh smoke [options]
   ./scripts/blacklight.sh eval [options]
+  ./scripts/blacklight.sh bench [options]
+  ./scripts/blacklight.sh promote [options]
+  ./scripts/blacklight.sh sweep [options]
   ./scripts/blacklight.sh status
   ./scripts/blacklight.sh monitor [options]
   ./scripts/blacklight.sh help
@@ -20,10 +23,11 @@ Usage:
 If no command is given, "train" is used.
 
 Train options:
+  --profile NAME
   --duration SECONDS
   --rounds COUNT
   --checkpoint-every COUNT
-  --resume MODEL_PATH
+  --resume MODEL_PATH_OR_RUN
   --generation NAME
   --name RUN_NAME
   --bin PATH
@@ -42,6 +46,20 @@ Eval options:
   --rounds COUNT
   --candidate MODEL_PATH
   --reference MODEL_PATH
+  --bin PATH
+
+Bench options:
+  --suite NAME
+  --candidate MODEL_PATH_OR_RUN
+  --reference MODEL_PATH_OR_RUN
+  --bin PATH
+
+Promote options:
+  --candidate MODEL_PATH_OR_RUN
+  --bin PATH
+
+Sweep options:
+  --profile-chain classic
   --bin PATH
 
 Monitor options:
@@ -94,6 +112,11 @@ worker_experience_bytes() {
     local record_rel
     local record_abs
     local record_size
+
+    if [[ -f "${RECORD_ABS:-}" ]]; then
+        blacklight_file_size "${RECORD_ABS}"
+        return 0
+    fi
 
     if [[ ! -f "${SOURCE_LIST_ABS:-}" ]]; then
         printf '0\n'
@@ -157,6 +180,17 @@ print_status_line() {
     printf '%-20s %s\n' "${label}" "${value}"
 }
 
+print_source_progress_status() {
+    if [[ -z "${STATE_FILE_ABS:-}" || -z "${SOURCE_LIST_ABS:-}" ]]; then
+        return 0
+    fi
+
+    while IFS='|' read -r source_path source_episodes source_offset; do
+        [[ -n "${source_path}" ]] || continue
+        echo "source_progress ${source_path} episodes=${source_episodes} offset_bytes=${source_offset}"
+    done < <(blacklight_format_source_progress "${STATE_FILE_ABS}" "${SOURCE_LIST_ABS}")
+}
+
 show_status() {
     load_current_run_state
 
@@ -172,9 +206,18 @@ show_status() {
     local remaining_display="n/a"
     local running_workers="0"
     local worker_bytes="0"
+    local experience_growth_bytes="0"
     local last_sync_display=""
+    local avg_sync_seconds="n/a"
     local now=""
     local runtime_phase_value=""
+    local rolling100_win_rate="n/a"
+    local rolling100_reward="n/a"
+    local rolling100_distance="n/a"
+    local rolling500_win_rate="n/a"
+    local rolling500_reward="n/a"
+    local rolling500_distance="n/a"
+    local champion_model=""
 
     if [[ -f "${MODEL_ABS:-}" ]]; then
         model_stats="$(blacklight_model_stats_line "${MODEL_ABS}")"
@@ -196,6 +239,19 @@ show_status() {
     current_cycle="${CURRENT_CYCLE:-0}"
     running_workers="$(running_worker_count)"
     worker_bytes="$(worker_experience_bytes)"
+    experience_growth_bytes="$(blacklight_current_experience_growth "${worker_bytes}" "${LAST_SYNC_EXPERIENCE_BYTES:-0}")"
+    avg_sync_seconds="$(blacklight_read_sync_metric "${EVENTS_LOG_ABS:-/dev/null}" avg)"
+
+    if [[ -f "${METRICS_ABS:-}" ]]; then
+        rolling100_win_rate="$(blacklight_read_metric_window "${METRICS_ABS}" 100 2)"
+        rolling100_reward="$(blacklight_read_metric_window "${METRICS_ABS}" 100 3)"
+        rolling100_distance="$(blacklight_read_metric_window "${METRICS_ABS}" 100 4)"
+        rolling500_win_rate="$(blacklight_read_metric_window "${METRICS_ABS}" 500 2)"
+        rolling500_reward="$(blacklight_read_metric_window "${METRICS_ABS}" 500 3)"
+        rolling500_distance="$(blacklight_read_metric_window "${METRICS_ABS}" 500 4)"
+    fi
+
+    champion_model="$(blacklight_current_champion_model || true)"
 
     now="$(date +%s)"
     if [[ -n "${TRAINING_STARTED_AT:-}" && "${TRAINING_STARTED_AT}" =~ ^[0-9]+$ ]]; then
@@ -213,8 +269,14 @@ show_status() {
     echo "Blacklight status"
     echo "run_name ${RUN_NAME:-unknown}"
     echo "generation ${GENERATION:-unknown}"
+    if [[ -n "${PROFILE:-}" ]]; then
+        echo "profile ${PROFILE}"
+    fi
     if [[ -n "${TRAINING_MODE:-}" ]]; then
         echo "training_mode ${TRAINING_MODE}"
+    fi
+    if [[ -n "${PARENT_MODEL:-}" ]]; then
+        echo "parent_model ${PARENT_MODEL}"
     fi
     if [[ -n "${PARALLEL_WORKERS:-}" ]]; then
         echo "parallel_workers ${PARALLEL_WORKERS}"
@@ -231,11 +293,13 @@ show_status() {
     echo "current_cycle ${current_cycle}"
     echo "workers_running ${running_workers}"
     echo "experience_bytes ${worker_bytes}"
+    echo "experience_growth_bytes ${experience_growth_bytes}"
     echo "elapsed ${elapsed_display}"
     echo "remaining ${remaining_display}"
     if [[ -n "${last_sync_display}" ]]; then
         echo "last_sync_duration ${last_sync_display}"
     fi
+    echo "avg_sync_seconds ${avg_sync_seconds}"
     if [[ -n "${PROGRESS_ABS:-}" ]]; then
         echo "progress_file ${PROGRESS_ABS}"
     fi
@@ -245,26 +309,43 @@ show_status() {
     if [[ -n "${EVENTS_LOG_ABS:-}" ]]; then
         echo "events_log ${EVENTS_LOG_ABS}"
     fi
-
     if [[ -f "${RECORD_ABS:-}" ]]; then
         echo "experience_log ${RECORD_ABS}"
     fi
-
     if [[ -f "${METRICS_SUMMARY_ABS:-}" ]]; then
         echo "metrics_summary ${METRICS_SUMMARY_ABS}"
         echo "metrics_episodes $(read_summary_value "${METRICS_SUMMARY_ABS}" episodes)"
         echo "metrics_win_rate $(read_summary_value "${METRICS_SUMMARY_ABS}" win_rate)"
         echo "metrics_average_reward $(read_summary_value "${METRICS_SUMMARY_ABS}" average_reward)"
+        echo "metrics_average_distance $(read_summary_value "${METRICS_SUMMARY_ABS}" average_distance)"
         echo "metrics_average_predicted_value $(read_summary_value "${METRICS_SUMMARY_ABS}" average_predicted_value)"
+        echo "rolling100_win_rate ${rolling100_win_rate}"
+        echo "rolling100_average_reward ${rolling100_reward}"
+        echo "rolling100_average_distance ${rolling100_distance}"
+        echo "rolling500_win_rate ${rolling500_win_rate}"
+        echo "rolling500_average_reward ${rolling500_reward}"
+        echo "rolling500_average_distance ${rolling500_distance}"
     fi
-
     if [[ -n "${latest_checkpoint}" ]]; then
         echo "latest_checkpoint ${latest_checkpoint}"
     fi
-
+    if [[ -n "${CHOSEN_CHECKPOINT_ABS:-}" ]]; then
+        echo "chosen_checkpoint ${CHOSEN_CHECKPOINT_ABS}"
+    fi
+    if [[ -n "${BENCH_REPORT_ABS:-}" ]]; then
+        echo "bench_report ${BENCH_REPORT_ABS}"
+    fi
+    if [[ -n "${PROMOTION_STATUS:-}" ]]; then
+        echo "promotion_status ${PROMOTION_STATUS}"
+    fi
     if [[ -n "${latest_eval_report}" ]]; then
         echo "latest_eval_report ${latest_eval_report}"
     fi
+    if [[ -n "${champion_model}" ]]; then
+        echo "champion_model ${champion_model}"
+    fi
+
+    print_source_progress_status
 }
 
 render_monitor() {
@@ -278,15 +359,24 @@ render_monitor() {
     local cycle_remaining_display="n/a"
     local sync_elapsed_display=""
     local last_sync_display="n/a"
+    local avg_sync_seconds="n/a"
     local model_episodes="0"
     local model_updates="0"
     local metrics_episodes="0"
     local metrics_win_rate="n/a"
     local metrics_reward="n/a"
+    local metrics_distance="n/a"
     local metrics_value="n/a"
     local metrics_steps="n/a"
+    local rolling100_win_rate="n/a"
+    local rolling100_reward="n/a"
+    local rolling100_distance="n/a"
+    local rolling500_win_rate="n/a"
+    local rolling500_reward="n/a"
+    local rolling500_distance="n/a"
     local running_workers="0"
     local worker_bytes="0"
+    local experience_growth_bytes="0"
     local recent_events=""
     local runtime_phase_value=""
     local overall_progress_bar=""
@@ -301,6 +391,7 @@ render_monitor() {
     local cycle_elapsed_seconds=0
     local total_duration_seconds=0
     local total_duration_display=""
+    local champion_model=""
 
     now="$(date +%s)"
     runtime_phase_value="$(runtime_phase)"
@@ -310,13 +401,25 @@ render_monitor() {
     model_updates="$(blacklight_model_updates "${MODEL_ABS:-}")"
     running_workers="$(running_worker_count)"
     worker_bytes="$(worker_experience_bytes)"
+    experience_growth_bytes="$(blacklight_current_experience_growth "${worker_bytes}" "${LAST_SYNC_EXPERIENCE_BYTES:-0}")"
+    avg_sync_seconds="$(blacklight_read_sync_metric "${EVENTS_LOG_ABS:-/dev/null}" avg)"
+    champion_model="$(blacklight_current_champion_model || true)"
 
     if [[ -f "${METRICS_SUMMARY_ABS:-}" ]]; then
         metrics_episodes="$(read_summary_value "${METRICS_SUMMARY_ABS}" episodes)"
         metrics_win_rate="$(read_summary_value "${METRICS_SUMMARY_ABS}" win_rate)"
         metrics_reward="$(read_summary_value "${METRICS_SUMMARY_ABS}" average_reward)"
+        metrics_distance="$(read_summary_value "${METRICS_SUMMARY_ABS}" average_distance)"
         metrics_value="$(read_summary_value "${METRICS_SUMMARY_ABS}" average_predicted_value)"
         metrics_steps="$(read_summary_value "${METRICS_SUMMARY_ABS}" average_steps)"
+    fi
+    if [[ -f "${METRICS_ABS:-}" ]]; then
+        rolling100_win_rate="$(blacklight_read_metric_window "${METRICS_ABS}" 100 2)"
+        rolling100_reward="$(blacklight_read_metric_window "${METRICS_ABS}" 100 3)"
+        rolling100_distance="$(blacklight_read_metric_window "${METRICS_ABS}" 100 4)"
+        rolling500_win_rate="$(blacklight_read_metric_window "${METRICS_ABS}" 500 2)"
+        rolling500_reward="$(blacklight_read_metric_window "${METRICS_ABS}" 500 3)"
+        rolling500_distance="$(blacklight_read_metric_window "${METRICS_ABS}" 500 4)"
     fi
 
     if [[ -n "${TRAINING_STARTED_AT:-}" && "${TRAINING_STARTED_AT}" =~ ^[0-9]+$ ]]; then
@@ -368,6 +471,7 @@ render_monitor() {
 
     print_status_line "Run" "${RUN_NAME:-unknown}"
     print_status_line "Generation" "${GENERATION:-unknown}"
+    print_status_line "Profile" "${PROFILE:-none}"
     print_status_line "Mode" "${TRAINING_MODE:-unknown}"
     print_status_line "Phase" "${phase_display}"
     print_status_line "Cycle" "${cycle_display}"
@@ -391,6 +495,11 @@ render_monitor() {
         print_status_line "Sync Activity" "${sync_activity_bar}"
     fi
     print_status_line "Last Sync" "${last_sync_display}"
+    print_status_line "Avg Sync (s)" "${avg_sync_seconds}"
+    print_status_line "Exp Growth" "$(blacklight_human_bytes "${experience_growth_bytes}")"
+    if [[ -n "${champion_model}" ]]; then
+        print_status_line "Champion" "${champion_model}"
+    fi
     printf '\n'
 
     print_status_line "Model Episodes" "${model_episodes}"
@@ -398,18 +507,46 @@ render_monitor() {
     print_status_line "Metrics Episodes" "${metrics_episodes:-0}"
     print_status_line "Win Rate" "${metrics_win_rate:-n/a}"
     print_status_line "Avg Reward" "${metrics_reward:-n/a}"
+    print_status_line "Avg Distance" "${metrics_distance:-n/a}"
     print_status_line "Avg Value" "${metrics_value:-n/a}"
     print_status_line "Avg Steps" "${metrics_steps:-n/a}"
+    print_status_line "Rolling100 Win" "${rolling100_win_rate}"
+    print_status_line "Rolling100 Rwd" "${rolling100_reward}"
+    print_status_line "Rolling100 Dist" "${rolling100_distance}"
+    print_status_line "Rolling500 Win" "${rolling500_win_rate}"
+    print_status_line "Rolling500 Rwd" "${rolling500_reward}"
+    print_status_line "Rolling500 Dist" "${rolling500_distance}"
     print_status_line "Experience" "$(blacklight_human_bytes "${worker_bytes}")"
     printf '\n'
 
     print_status_line "Run Dir" "${RUN_DIR_ABS:-unknown}"
     print_status_line "Model File" "${MODEL_ABS:-missing}"
+    if [[ -n "${PARENT_MODEL:-}" ]]; then
+        print_status_line "Parent Model" "${PARENT_MODEL}"
+    fi
+    if [[ -n "${CHOSEN_CHECKPOINT_ABS:-}" ]]; then
+        print_status_line "Chosen Checkpoint" "${CHOSEN_CHECKPOINT_ABS}"
+    fi
+    if [[ -n "${BENCH_REPORT_ABS:-}" ]]; then
+        print_status_line "Bench Report" "${BENCH_REPORT_ABS}"
+    fi
+    if [[ -n "${PROMOTION_STATUS:-}" ]]; then
+        print_status_line "Promotion" "${PROMOTION_STATUS}"
+    fi
     if [[ -n "${TRAINER_LOG_ABS:-}" ]]; then
         print_status_line "Trainer Log" "${TRAINER_LOG_ABS}"
     fi
     if [[ -n "${EVENTS_LOG_ABS:-}" ]]; then
         print_status_line "Events Log" "${EVENTS_LOG_ABS}"
+    fi
+
+    if [[ -n "${SOURCE_LIST_ABS:-}" && -n "${STATE_FILE_ABS:-}" ]]; then
+        printf '\nSource progress\n'
+        printf '%s\n' '---------------'
+        while IFS='|' read -r source_path source_episodes source_offset; do
+            [[ -n "${source_path}" ]] || continue
+            printf '%s | episodes %s | offset %s bytes\n' "${source_path}" "${source_episodes}" "${source_offset}"
+        done < <(blacklight_format_source_progress "${STATE_FILE_ABS}" "${SOURCE_LIST_ABS}")
     fi
 
     if [[ -n "${recent_events}" ]]; then
@@ -463,6 +600,7 @@ run_monitor() {
 }
 
 run_train() {
+    local profile=""
     local duration=""
     local rounds=""
     local checkpoint_every=""
@@ -474,9 +612,17 @@ run_train() {
     local heavy_mode="0"
     local parallel_workers=""
     local sync_seconds=""
+    local resolved_resume_model=""
+    local training_mode=""
+    local profile_default=""
+    local profile_value=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --profile)
+                profile="$2"
+                shift 2
+                ;;
             --duration)
                 duration="$2"
                 shift 2
@@ -533,6 +679,76 @@ run_train() {
         esac
     done
 
+    profile_default="$(blacklight_train_profile_default)"
+    if [[ -z "${profile}" ]]; then
+        profile="${profile_default}"
+    fi
+    if ! blacklight_train_profile_exists "${profile}"; then
+        echo "Unknown Blacklight training profile: ${profile}" >&2
+        exit 1
+    fi
+
+    if [[ "${profile}" != "none" ]]; then
+        profile_value="$(blacklight_train_profile_value "${profile}" training_mode)"
+        if [[ -z "${training_mode}" && -n "${profile_value}" ]]; then
+            training_mode="${profile_value}"
+        fi
+
+        [[ -n "${duration}" ]] || duration="$(blacklight_train_profile_value "${profile}" duration_seconds)"
+        [[ -n "${checkpoint_every}" ]] || checkpoint_every="$(blacklight_train_profile_value "${profile}" checkpoint_every)"
+        [[ -n "${parallel_workers}" ]] || parallel_workers="$(blacklight_train_profile_value "${profile}" parallel_workers)"
+        [[ -n "${sync_seconds}" ]] || sync_seconds="$(blacklight_train_profile_value "${profile}" sync_seconds)"
+
+        export ARMAGETRON_SELFPLAY_PROFILE="${profile}"
+        profile_value="$(blacklight_train_profile_value "${profile}" bot_count)"
+        [[ -n "${profile_value}" ]] && export ARMAGETRON_SELFPLAY_BOT_COUNT="${profile_value}"
+        profile_value="$(blacklight_train_profile_value "${profile}" exploration)"
+        [[ -n "${profile_value}" ]] && export ARMAGETRON_SELFPLAY_EXPLORATION="${profile_value}"
+        profile_value="$(blacklight_train_profile_value "${profile}" train_epochs)"
+        [[ -n "${profile_value}" ]] && export ARMAGETRON_SELFPLAY_TRAIN_EPOCHS="${profile_value}"
+        profile_value="$(blacklight_train_profile_value "${profile}" record_stride)"
+        [[ -n "${profile_value}" ]] && export ARMAGETRON_SELFPLAY_RECORD_STRIDE="${profile_value}"
+        [[ -n "${parallel_workers}" ]] && export ARMAGETRON_SELFPLAY_PARALLEL_RECORD_STRIDE="$(blacklight_train_profile_value "${profile}" record_stride)"
+        profile_value="$(blacklight_train_profile_value "${profile}" save_every)"
+        [[ -n "${profile_value}" && -z "${ARMAGETRON_SELFPLAY_SAVE_EVERY:-}" ]] && export ARMAGETRON_SELFPLAY_SAVE_EVERY="${profile_value}"
+        profile_value="$(blacklight_train_profile_value "${profile}" policy_pool_size)"
+        [[ -n "${profile_value}" ]] && export ARMAGETRON_SELFPLAY_POLICY_POOL_SIZE="${profile_value}"
+        profile_value="$(blacklight_train_profile_value "${profile}" policy_snapshot_every)"
+        [[ -n "${profile_value}" ]] && export ARMAGETRON_SELFPLAY_POLICY_SNAPSHOT_EVERY="${profile_value}"
+        profile_value="$(blacklight_train_profile_value "${profile}" policy_snapshot_warmup)"
+        [[ -n "${profile_value}" ]] && export ARMAGETRON_SELFPLAY_POLICY_SNAPSHOT_WARMUP="${profile_value}"
+        profile_value="$(blacklight_train_profile_value "${profile}" policy_historic_prob)"
+        [[ -n "${profile_value}" ]] && export ARMAGETRON_SELFPLAY_POLICY_HISTORIC_PROB="${profile_value}"
+        profile_value="$(blacklight_train_profile_value "${profile}" min_players)"
+        [[ -n "${profile_value}" ]] && export ARMAGETRON_SELFPLAY_MIN_PLAYERS="${profile_value}"
+        profile_value="$(blacklight_train_profile_value "${profile}" teams_min)"
+        [[ -n "${profile_value}" ]] && export ARMAGETRON_SELFPLAY_TEAMS_MIN="${profile_value}"
+        profile_value="$(blacklight_train_profile_value "${profile}" teams_max)"
+        [[ -n "${profile_value}" ]] && export ARMAGETRON_SELFPLAY_TEAMS_MAX="${profile_value}"
+    else
+        export ARMAGETRON_SELFPLAY_PROFILE="none"
+    fi
+
+    if [[ -z "${training_mode}" ]]; then
+        if [[ -n "${parallel_workers}" || -n "${sync_seconds}" ]]; then
+            training_mode="parallel"
+        else
+            training_mode="selfplay"
+        fi
+    fi
+
+    if [[ -n "${resume_model}" ]]; then
+        if ! resolved_resume_model="$(blacklight_resolve_model_input "${resume_model}" 1)"; then
+            echo "Could not resolve resume model: ${resume_model}" >&2
+            exit 1
+        fi
+        export ARMAGETRON_SELFPLAY_INITIAL_MODEL="${resolved_resume_model}"
+        export ARMAGETRON_SELFPLAY_PARENT_MODEL="${resolved_resume_model}"
+    elif [[ "${profile}" == "classic_hardening" || "${profile}" == "mixed_league" ]]; then
+        echo "Profile ${profile} requires --resume MODEL_PATH_OR_RUN." >&2
+        exit 1
+    fi
+
     if [[ -n "${duration}" ]]; then
         export ARMAGETRON_SELFPLAY_DURATION_SECONDS="${duration}"
     fi
@@ -541,9 +757,6 @@ run_train() {
     fi
     if [[ -n "${checkpoint_every}" ]]; then
         export ARMAGETRON_SELFPLAY_CHECKPOINT_EVERY="${checkpoint_every}"
-    fi
-    if [[ -n "${resume_model}" ]]; then
-        export ARMAGETRON_SELFPLAY_INITIAL_MODEL="${resume_model}"
     fi
     if [[ -n "${generation}" ]]; then
         export ARMAGETRON_SELFPLAY_GENERATION="${generation}"
@@ -567,9 +780,9 @@ run_train() {
         export ARMAGETRON_SELFPLAY_SYNC_SECONDS="${sync_seconds}"
     fi
 
-    if [[ -n "${parallel_workers}" || -n "${sync_seconds}" ]]; then
+    if [[ "${training_mode}" == "parallel" ]]; then
         if [[ "${fast_mode}" == "1" ]]; then
-            echo "Parallel Blacklight training needs worker experience logs, so --fast cannot be combined with --parallel-workers/--sync-seconds." >&2
+            echo "Parallel Blacklight training needs worker experience logs, so --fast cannot be combined with parallel training." >&2
             exit 1
         fi
         exec "${SCRIPT_DIR}/train_neural_ai_parallel.sh"
@@ -682,6 +895,121 @@ run_eval() {
     fi
 }
 
+run_bench() {
+    local suite=""
+    local candidate=""
+    local reference=""
+    local bin_path=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --suite)
+                suite="$2"
+                shift 2
+                ;;
+            --candidate)
+                candidate="$2"
+                shift 2
+                ;;
+            --reference)
+                reference="$2"
+                shift 2
+                ;;
+            --bin)
+                bin_path="$2"
+                shift 2
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "Unknown bench option: $1" >&2
+                usage >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    [[ -n "${suite}" ]] || { echo "bench requires --suite." >&2; exit 1; }
+    [[ -n "${candidate}" ]] || { echo "bench requires --candidate." >&2; exit 1; }
+    if [[ -n "${bin_path}" ]]; then
+        export ARMAGETRON_SELFPLAY_BIN="${bin_path}"
+    fi
+
+    if [[ -n "${reference}" ]]; then
+        exec "${SCRIPT_DIR}/benchmark_blacklight.sh" --suite "${suite}" --candidate "${candidate}" --reference "${reference}"
+    fi
+    exec "${SCRIPT_DIR}/benchmark_blacklight.sh" --suite "${suite}" --candidate "${candidate}"
+}
+
+run_promote() {
+    local candidate=""
+    local bin_path=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --candidate)
+                candidate="$2"
+                shift 2
+                ;;
+            --bin)
+                bin_path="$2"
+                shift 2
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "Unknown promote option: $1" >&2
+                usage >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    [[ -n "${candidate}" ]] || { echo "promote requires --candidate." >&2; exit 1; }
+    if [[ -n "${bin_path}" ]]; then
+        export ARMAGETRON_SELFPLAY_BIN="${bin_path}"
+    fi
+
+    exec "${SCRIPT_DIR}/promote_blacklight.sh" --candidate "${candidate}"
+}
+
+run_sweep() {
+    local profile_chain="classic"
+    local bin_path=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --profile-chain)
+                profile_chain="$2"
+                shift 2
+                ;;
+            --bin)
+                bin_path="$2"
+                shift 2
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "Unknown sweep option: $1" >&2
+                usage >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    if [[ -n "${bin_path}" ]]; then
+        export ARMAGETRON_SELFPLAY_BIN="${bin_path}"
+    fi
+
+    exec "${SCRIPT_DIR}/sweep_blacklight.sh" --profile-chain "${profile_chain}"
+}
+
 COMMAND="${1:-train}"
 if [[ $# -gt 0 ]]; then
     shift
@@ -696,6 +1024,15 @@ case "${COMMAND}" in
         ;;
     eval)
         run_eval "$@"
+        ;;
+    bench)
+        run_bench "$@"
+        ;;
+    promote)
+        run_promote "$@"
+        ;;
+    sweep)
+        run_sweep "$@"
         ;;
     monitor)
         run_monitor "$@"
