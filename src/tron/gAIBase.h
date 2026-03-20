@@ -73,6 +73,11 @@ public:
 
     gCycle * Object(){ return object_; }
     void SetObject( gCycle * cycle ){ object_ = cycle; }
+    virtual void OnRoundResult( bool survived, REAL distance )
+    {
+        (void)survived;
+        (void)distance;
+    }
 protected:
     virtual REAL DoThink() = 0;
 private:
@@ -97,6 +102,12 @@ class gAIPlayer: public ePlayerNetID{
     tReproducibleRandomizer randomizer_;
 protected:
     gSimpleAI *simpleAI_;
+    bool useSimpleAI_;
+    bool simpleAIResultReported_;
+    bool aiEvalResultReported_;
+    bool hasLastObjectState_;
+    bool lastObjectAlive_;
+    REAL lastObjectDistance_;
     gAICharacter*           character; // our specification of abilities
 
     // for all offensive modes:
@@ -182,6 +193,8 @@ struct ThinkData : public ThinkDataBase
     virtual void ActOnData( ThinkDataBase & data );
 public:
     gAICharacter* Character() const {return character;}
+    bool UseSimpleAI() const { return useSimpleAI_; }
+    void SetUseSimpleAI( bool useSimpleAI );
 
     //	virtual void AddRef();
     //	virtual void Release();
@@ -214,8 +227,8 @@ public:
 
     void ClearTarget(){target=NULL;}
 
-    virtual void ControlObject(eNetGameObject *c){ ePlayerNetID::ControlObject( c ); simpleAI_ = NULL; }
-    virtual void ClearObject(){ ePlayerNetID::ClearObject(); simpleAI_ = NULL; }
+    virtual void ControlObject(eNetGameObject *c) override;
+    virtual void ClearObject() override;
 
     // do some thinking. Return value: time to think again
     virtual REAL Think();

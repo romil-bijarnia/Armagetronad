@@ -1,0 +1,200 @@
+#!/bin/bash
+
+# expected to contain:
+# APPLE_ID: email address/apple ID of developer
+# TEAM_ID: Team ID of developer
+# APPLE_PASSWORD: application specific password from developer.apple.com
+# APPLE_SIGN_ID: passed to signing program to sign the dmg; must be of "Developer ID Application" type
+# LOGIN_PASSWORD: the user's login password to unlock the keychain
+test -r ~/.ssh/armabuild_secrets && . ~/.ssh/armabuild_secrets
+
+# BUNDLE STRUCTURE
+# https://developer.apple.com/library/archive/documentation/CoreFoundation/Conceptual/CFBundles/BundleTypes/BundleTypes.html
+# for correct results, use the configure_for_bundle.sh script here instead of configure in the main source directory
+
+set -x
+
+DIR=$1
+test -z "${DIR}" && DIR="`pwd`"
+
+TITLE="Armagetron Advanced Server"
+BUNDLE="${DIR}/${TITLE}.app"
+TMP_ZIP="${DIR}/${TITLE}".zip
+BUNDLE_ID=org.$(echo armagetronad-dedicated | sed -e s,-0.4.0_alpha_z5899_20260223,, -e s,-,.,g -e s,_,.,g)
+
+if test "yes" != "${SKIP_PART_1}"; then
+
+rm -rf "${BUNDLE}"
+mkdir -p "${BUNDLE}" || exit $?
+
+# install game into bundle
+DESTDIR="${BUNDLE}" make install || exit $?
+
+# add plist with @v@ -> value and progtitle replacements
+sed < "/Users/romilbijarnia/Desktop/Armagetron/desktop/os-x/Info.plist" > "${BUNDLE}/usr/local/Info.plist" \
+-e "s,BUNDLE_ID,${BUNDLE_ID},g" \
+|| exit $?
+
+# add icons
+cp "/Users/romilbijarnia/Desktop/Armagetron/desktop/os-x/armagetronad.icns" "${BUNDLE}${prefix}/share/${TITLE}.icns" || exit $?
+
+# adapt to MacOS expected structure https://stackoverflow.com/a/32025478
+#mv "${BUNDLE}"/usr/local "${BUNDLE}"/Contents 
+#mv "${BUNDLE}"/Contents/bin "${BUNDLE}"/Contents/MacOS
+
+# additional libraries
+EXTRALIB=
+if test -z " Server"; then
+    for adlib in /usr/local/opt/sdl2/lib/libSDL2-*.dylib; do
+        if test -r ${adlib}; then
+            mkdir -p "${BUNDLE}/${exec_prefix}/lib/"
+            cp ${adlib} "${BUNDLE}/${exec_prefix}/lib/"
+           EXTRALIB="${EXTRALIB} -x ./${exec_prefix}/lib/`basename ${adlib}`"
+        fi
+    done
+fi
+
+# bundle libraries
+#(cd "${BUNDLE}"; dylibbundler -od -b -x "./Contents/MacOS/armagetronad-dedicated" -d "./Contents/Frameworks/" -i /usr/lib/ -p '@executable_path/../Frameworks/') || exit $?
+(cd "${BUNDLE}"; dylibbundler -cd -of -b -x "./${exec_prefix}/bin/armagetronad-dedicated" ${EXTRALIB} -d "./${exec_prefix}/lib/" -i /usr/lib/ -p @executable_path/../..${exec_prefix}/lib/) || exit $?
+
+# Sign executable
+# original source: https://localazy.com/blog/how-to-automatically-sign-macos-apps-using-github-actions
+# semi-official comprehensive guides: https://developer.apple.com/forums/thread/128166
+if ! test -z "${APPLE_ID}"; then
+	# find correct real XCODE, if possible; the command line tools will not do (https://github.com/xamarin/xamarin-macios/issues/3931)
+    XCODE_DIR=$(ls /Applications | grep Xcode | head -n 1)
+    if ! test -z "${XCODE_DIR}"; then
+        export DEVELOPER_DIR=/Applications/${XCODE_DIR}
+        export XCODE_DEVELOPER_DIR_PATH=${DEVELOPER_DIR}/Contents/Developer
+    fi
+
+	# unlock keychain https://stackoverflow.com/a/57719571
+	set +x
+	if ! test -z "${LOGIN_PASSWORD}"; then
+		echo security unlock-keychain -p ... login.keychain
+		security unlock-keychain -p "${LOGIN_PASSWORD}" login.keychain || exit $?
+	fi
+	set -x
+
+	#for f in "${BUNDLE}"/Contents/Frameworks/*.dylib; do
+	for f in "${BUNDLE}"${exec_prefix}/lib/*.dylib "${BUNDLE}"${exec_prefix}/lib/*image*.dylib; do
+		if test -r "$f"; then 
+			xcrun codesign --force --verify --verbose --sign "${APPLE_SIGN_ID}" "$f" || exit $?
+			spctl -a -t exec -vv "$f"
+			xcrun codesign --verify --verbose "$f" || exit $?
+		fi
+	done
+
+	for f in "${BUNDLE}"${exec_prefix}/bin/*serverquery "${BUNDLE}"${exec_prefix}/bin/armagetronad-dedicated; do
+		if test -r "$f"; then 
+			xcrun codesign --force --verify --verbose --options runtime --sign "${APPLE_SIGN_ID}" "$f" || exit $?
+			xcrun codesign --verify --verbose --deep "$f" || exit $?
+		fi
+	done
+
+	xcrun codesign --force --options runtime --sign "${APPLE_SIGN_ID}" "${BUNDLE}" || exit $?
+
+	xcrun codesign --verify --verbose "${BUNDLE}" || exit $?
+
+	for f in "${BUNDLE}"${exec_prefix}/bin/*; do
+		xcrun codesign --verify --verbose --deep "$f" || exit $?
+	done
+	for f in "${BUNDLE}"${exec_prefix}/lib/*.dylib; do
+		if test -r "$f"; then
+			xcrun codesign --verify --verbose --deep "$f" || exit $?
+		fi
+	done
+	xcrun codesign --verify --verbose --deep "${BUNDLE}" || exit $?
+fi
+
+#rm -rf "${BUNDLE}"/etc "${BUNDLE}"/usr
+du "${BUNDLE}"
+# spctl -a -t exec -vv "${BUNDLE}" || exit $?
+
+# for debugging pure app bundle builds
+# xattr -w -r com.apple.quarantine "0181;628a01ca;Firefox;6710DDFB-2A74-41E4-8763-14F065F9DA1F" "${BUNDLE}"
+# exit 0
+
+# pack for notarization
+# according to http://www.zarkonnen.com/signing_notarizing_catalina https://www.reddit.com/r/gamedev/comments/di61ms/have_a_mac_game_on_steam_heres_a_guide_to_signing/
+/usr/bin/ditto -c -k --keepParent "${BUNDLE}" "${TMP_ZIP}" || exit $?
+
+if ! test -z "${APPLE_ID}"; then
+	# Sign image
+	# xcrun codesign --force --sign "${APPLE_SIGN_ID}" "${DMG}" || exit $?
+
+	# for debugging, getting strange errors from AWS about request timestamps not being correct, maybe the builder's clock is skewed?
+	date
+	sntp -s time.apple.com
+	# notarize
+	set +x # password in command line, do not log any more
+	# try xcode 13 way first, will work longer, and automatically waits for completion
+	if ! xcrun notarytool submit "${TMP_ZIP}" --wait --apple-id "${APPLE_ID}" --team-id "${TEAM_ID}" --password "${APPLE_PASSWORD}"; then
+		# try without xcrun (which falsely likes to claim notarytool is incompatible)
+		notarytool submit "${TMP_ZIP}" --wait --apple-id "${APPLE_ID}" --team-id "${TEAM_ID}" --password "${APPLE_PASSWORD}" || exit $?
+	fi
+fi
+
+fi # SKIP_PART_1
+if test yes = "${SKIP_PART_2}"; then exit 0; fi
+
+if ! test -z "${APPLE_ID}"; then
+	# staple
+	exit_status=65
+	for (( ; ; ))
+	do
+		# break
+    	xcrun stapler staple "${BUNDLE}"
+    	exit_status=$?
+    	if [ "${exit_status}" = "65" ]
+    	then
+        	echo "Waiting for notarization to complete"
+	        sleep 60
+    	else
+        	echo "Stapler status: ${exit_status}"
+        	break
+    	fi
+	done
+
+	# for testing: manually quarantine
+	# xattr -w com.apple.quarantine "0181;628a01ca;Firefox;6710DDFB-2A74-41E4-8763-14F065F9DA1F" "${DMG}"
+
+	# check state
+	spctl --assess --type open --context context:primary-signature --verbose "${BUNDLE}"
+fi
+
+# zip
+# (cd "${BUNDLE}" && zip -r ../armagetronad-dedicated-0.4.0_alpha_z5899_20260223.macOS.zip .) || exit $?
+suffix=client
+test "armagetronad-dedicated" = "armagetronad" || suffix=server
+ZIP="${DIR}/armagetronad-${suffix}-0.4.0_alpha_z5899_20260223.macOS.zip"
+rm -f "${ZIP}"
+/usr/bin/ditto -c -k --keepParent "${BUNDLE}" "${ZIP}" || exit $?
+rm -f "${TMP_ZIP}"
+
+# pack dmg
+
+# mkdir pack
+# cp -a "${BUNDLE}" pack || exit $?
+# --sandbox-safe
+# --icon "$ICON" 200 190 \
+# DMG_SRC=pack
+DMG_SRC=${BUNDLE}
+DMG="${DIR}/armagetronad-dedicated-0.4.0_alpha_z5899_20260223.dmg"
+rm -f "${DMG}"
+ICON="/Users/romilbijarnia/Desktop/Armagetron/desktop/os-x/armagetronad.icns"
+BG="/Users/romilbijarnia/Desktop/Armagetron/desktop/os-x/background.png"
+create-dmg \
+	--volicon "$ICON" \
+	--app-drop-link 470 180 --window-pos 200 112 --window-size 650 330 \
+	--icon "${TITLE}.app" 220 80 \
+	--icon-size 100 \
+	--hide-extension "${TITLE}.app" \
+	--background ${BG} \
+	"${DMG}" "${DMG_SRC}" || exit $?
+
+# alternative, native way, less powerful
+# hdiutil create -volname "Armagetron Advanced" -srcfolder "${BUNDLE}" -ov -format UDIF "${DMG}"
+
+# rm -rf "${DMG_SRC}"

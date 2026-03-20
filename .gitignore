@@ -41,6 +41,8 @@ Makefile
 /config.guess
 /extrapaths
 /stamp-h1
+/config/generated_blacklight_*.cfg
+/config/generated_eval_*.cfg
 /universal_variable*
 batch/relocate
 batch/relocate.in

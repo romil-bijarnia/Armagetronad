@@ -53,6 +53,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "ePlayer.h"
 #include "gLanguageMenu.h"
 #include "gAICharacter.h"
+#include "gTrainedAI.h"
 #include "gCycle.h"
 //#include <unistd>
 #include <stdio.h>
@@ -836,6 +837,7 @@ int main(int argc,char **argv){
 
         //gAICharacter::LoadAll(tString( "aiplayers.cfg" ) );
         gAICharacter::LoadAll( aiPlayersConfig );
+        gTrainedAI_InstallFactoryIfEnabled();
 
         sg_LanguageInit();
         atexit(tLocale::Clear);
@@ -943,6 +945,9 @@ int main(int argc,char **argv){
                         std::cerr << e.what() << '\n';
                     }
 #endif
+
+                    // Re-apply the configured AI factory in case scripts replaced it.
+                    gTrainedAI_InstallFactoryIfEnabled();
 
                     MainMenu();
 

@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/blacklight_lib.sh"
+REPO_ROOT="${BLACKLIGHT_REPO_ROOT}"
+
+BASE_CFG_REL="${ARMAGETRON_SELFPLAY_BASE_CFG_REL:-examples/trained_ai_selfplay.cfg}"
+BASE_CFG_PATH="${REPO_ROOT}/config/${BASE_CFG_REL}"
+GENERATION="${ARMAGETRON_SELFPLAY_GENERATION:-blacklight_v10_classicmix}"
+RUN_ID="${ARMAGETRON_SELFPLAY_RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
+RUN_NAME="${ARMAGETRON_SELFPLAY_RUN_NAME:-${GENERATION}_${RUN_ID}}"
+RUN_DIR_REL="${ARMAGETRON_SELFPLAY_RUN_DIR_REL:-blacklight_runs/${RUN_NAME}}"
+RUN_DIR_ABS="${REPO_ROOT}/var/${RUN_DIR_REL}"
+
+MODEL_REL="${ARMAGETRON_SELFPLAY_MODEL_REL:-${RUN_DIR_REL}/trained_ai_model.txt}"
+RECORD_REL="${ARMAGETRON_SELFPLAY_RECORD_REL:-${RUN_DIR_REL}/trained_ai_selfplay_experience.log}"
+METRICS_REL="${ARMAGETRON_SELFPLAY_METRICS_REL:-${RUN_DIR_REL}/trained_ai_training_metrics.csv}"
+CHECKPOINT_PREFIX_REL="${ARMAGETRON_SELFPLAY_CHECKPOINT_PREFIX_REL:-${RUN_DIR_REL}/checkpoints/blacklight}"
+CHECKPOINT_EVERY="${ARMAGETRON_SELFPLAY_CHECKPOINT_EVERY:-}"
+SAVE_EVERY="${ARMAGETRON_SELFPLAY_SAVE_EVERY:-}"
+LIMIT_ROUNDS="${ARMAGETRON_SELFPLAY_LIMIT_ROUNDS:-0}"
+DURATION_SECONDS="${ARMAGETRON_SELFPLAY_DURATION_SECONDS:-0}"
+INITIAL_MODEL="${ARMAGETRON_SELFPLAY_INITIAL_MODEL:-}"
+FAST_MODE="${ARMAGETRON_SELFPLAY_FAST_MODE:-0}"
+HEAVY_MODE="${ARMAGETRON_SELFPLAY_HEAVY_MODE:-0}"
+THINK_TIME="${ARMAGETRON_SELFPLAY_THINK_TIME:-}"
+TRAIN_EPOCHS="${ARMAGETRON_SELFPLAY_TRAIN_EPOCHS:-}"
+RECORD_STRIDE="${ARMAGETRON_SELFPLAY_RECORD_STRIDE:-}"
+DEDICATED_FPS_OVERRIDE="${ARMAGETRON_SELFPLAY_DEDICATED_FPS:-}"
+MIN_PLAYERS_OVERRIDE="${ARMAGETRON_SELFPLAY_MIN_PLAYERS:-}"
+TEAMS_MIN_OVERRIDE="${ARMAGETRON_SELFPLAY_TEAMS_MIN:-}"
+TEAMS_MAX_OVERRIDE="${ARMAGETRON_SELFPLAY_TEAMS_MAX:-}"
+
+GENERATED_CFG_REL="${ARMAGETRON_SELFPLAY_GENERATED_CFG_REL:-generated_blacklight_${RUN_NAME}.cfg}"
+GENERATED_CFG_PATH="${REPO_ROOT}/config/${GENERATED_CFG_REL}"
+MANIFEST_PATH="${RUN_DIR_ABS}/run_manifest.env"
+LATEST_MANIFEST_PATH="${BLACKLIGHT_LATEST_MANIFEST_PATH}"
+
+if [[ ! -f "${BASE_CFG_PATH}" ]]; then
+    echo "Missing self-play config: ${BASE_CFG_PATH}" >&2
+    exit 1
+fi
+
+if [[ "${HEAVY_MODE}" == "1" ]]; then
+    : "${THINK_TIME:=0.04}"
+    : "${TRAIN_EPOCHS:=6}"
+    : "${RECORD_STRIDE:=96}"
+    : "${DEDICATED_FPS_OVERRIDE:=360}"
+    : "${MIN_PLAYERS_OVERRIDE:=10}"
+    : "${TEAMS_MIN_OVERRIDE:=10}"
+    : "${TEAMS_MAX_OVERRIDE:=10}"
+fi
+
+mkdir -p "${RUN_DIR_ABS}/checkpoints"
+mkdir -p "${REPO_ROOT}/var/blacklight_runs"
+mkdir -p "$(dirname "${GENERATED_CFG_PATH}")"
+
+cat > "${GENERATED_CFG_PATH}" <<EOF
+SINCLUDE ${BASE_CFG_REL}
+AI_TRAINED_MODEL_FILE ${MODEL_REL}
+AI_TRAINED_RECORD_FILE ${RECORD_REL}
+AI_TRAINED_METRICS_FILE ${METRICS_REL}
+AI_TRAINED_CHECKPOINT_PREFIX ${CHECKPOINT_PREFIX_REL}
+EOF
+
+if [[ -n "${CHECKPOINT_EVERY}" ]]; then
+    printf 'AI_TRAINED_CHECKPOINT_EVERY %s\n' "${CHECKPOINT_EVERY}" >> "${GENERATED_CFG_PATH}"
+fi
+
+if [[ -n "${SAVE_EVERY}" ]]; then
+    printf 'AI_TRAINED_SAVE_EVERY %s\n' "${SAVE_EVERY}" >> "${GENERATED_CFG_PATH}"
+fi
+
+if [[ -n "${THINK_TIME}" ]]; then
+    printf 'AI_TRAINED_THINK_TIME %s\n' "${THINK_TIME}" >> "${GENERATED_CFG_PATH}"
+fi
+
+if [[ -n "${TRAIN_EPOCHS}" ]]; then
+    printf 'AI_TRAINED_TRAIN_EPOCHS %s\n' "${TRAIN_EPOCHS}" >> "${GENERATED_CFG_PATH}"
+fi
+
+if [[ -n "${RECORD_STRIDE}" ]]; then
+    printf 'AI_TRAINED_RECORD_STRIDE %s\n' "${RECORD_STRIDE}" >> "${GENERATED_CFG_PATH}"
+fi
+
+if [[ -n "${DEDICATED_FPS_OVERRIDE}" ]]; then
+    printf 'DEDICATED_FPS %s\n' "${DEDICATED_FPS_OVERRIDE}" >> "${GENERATED_CFG_PATH}"
+fi
+
+if [[ -n "${MIN_PLAYERS_OVERRIDE}" ]]; then
+    printf 'MIN_PLAYERS %s\n' "${MIN_PLAYERS_OVERRIDE}" >> "${GENERATED_CFG_PATH}"
+fi
+
+if [[ -n "${TEAMS_MIN_OVERRIDE}" ]]; then
+    printf 'TEAMS_MIN %s\n' "${TEAMS_MIN_OVERRIDE}" >> "${GENERATED_CFG_PATH}"
+fi
+
+if [[ -n "${TEAMS_MAX_OVERRIDE}" ]]; then
+    printf 'TEAMS_MAX %s\n' "${TEAMS_MAX_OVERRIDE}" >> "${GENERATED_CFG_PATH}"
+fi
+
+if [[ "${FAST_MODE}" == "1" ]]; then
+    cat >> "${GENERATED_CFG_PATH}" <<EOF
+AI_TRAINED_RECORD 0
+AI_TRAINED_SAVE_EVERY 100
+EOF
+fi
+
+if [[ "${LIMIT_ROUNDS}" != "0" ]]; then
+    printf 'LIMIT_ROUNDS %s\n' "${LIMIT_ROUNDS}" >> "${GENERATED_CFG_PATH}"
+fi
+
+cat > "${MANIFEST_PATH}" <<EOF
+RUN_NAME=${RUN_NAME}
+RUN_DIR_REL=${RUN_DIR_REL}
+RUN_DIR_ABS=${RUN_DIR_ABS}
+MODEL_REL=${MODEL_REL}
+MODEL_ABS=${REPO_ROOT}/var/${MODEL_REL}
+RECORD_REL=${RECORD_REL}
+RECORD_ABS=${REPO_ROOT}/var/${RECORD_REL}
+METRICS_REL=${METRICS_REL}
+METRICS_ABS=${REPO_ROOT}/var/${METRICS_REL}
+METRICS_SUMMARY_ABS=${REPO_ROOT}/var/${METRICS_REL}.latest
+CHECKPOINT_PREFIX_REL=${CHECKPOINT_PREFIX_REL}
+CHECKPOINT_PREFIX_ABS=${REPO_ROOT}/var/${CHECKPOINT_PREFIX_REL}
+GENERATED_CFG_REL=${GENERATED_CFG_REL}
+GENERATED_CFG_PATH=${GENERATED_CFG_PATH}
+BASE_CFG_REL=${BASE_CFG_REL}
+GENERATION=${GENERATION}
+EOF
+cp "${MANIFEST_PATH}" "${LATEST_MANIFEST_PATH}"
+
+if [[ -n "${INITIAL_MODEL}" ]]; then
+    cp "${INITIAL_MODEL}" "${REPO_ROOT}/var/${MODEL_REL}"
+fi
+
+if ! BIN_PATH="$(blacklight_find_server_bin "${ARMAGETRON_SELFPLAY_BIN:-}")"; then
+    cat >&2 <<'EOF'
+Could not find a dedicated-capable server binary.
+
+Set ARMAGETRON_SELFPLAY_BIN to your dedicated binary path, then rerun:
+  ARMAGETRON_SELFPLAY_BIN="/absolute/path/to/armagetronad-dedicated" ./scripts/blacklight.sh train
+EOF
+    exit 1
+fi
+if ! blacklight_preflight_server_bin "${BIN_PATH}"; then
+    exit 1
+fi
+
+COMMON_ARGS=(
+    --datadir "${REPO_ROOT}"
+    --configdir "${REPO_ROOT}/config"
+    --userdatadir "${REPO_ROOT}/var"
+    --vardir "${REPO_ROOT}/var"
+    --extraconfig "${GENERATED_CFG_REL}"
+)
+
+echo "Starting Blacklight self-play trainer..."
+echo "Binary: ${BIN_PATH}"
+echo "Run: ${RUN_NAME}"
+echo "Run dir: ${RUN_DIR_ABS}"
+echo "Manifest: ${MANIFEST_PATH}"
+echo "Config: ${GENERATED_CFG_REL}"
+if [[ "${FAST_MODE}" == "1" ]]; then
+    echo "Fast mode: on (recording disabled, lighter save cadence)"
+fi
+if [[ "${HEAVY_MODE}" == "1" ]]; then
+    echo "Heavy mode: on (more decisions, more epochs, more opponents, higher FPS)"
+fi
+
+if [[ "${DURATION_SECONDS}" != "0" ]]; then
+    echo "Duration: ${DURATION_SECONDS}s"
+    "${BIN_PATH}" "${COMMON_ARGS[@]}" &
+    SERVER_PID=$!
+    trap 'kill -TERM ${SERVER_PID} 2>/dev/null || true' INT TERM EXIT
+    sleep "${DURATION_SECONDS}"
+    kill -TERM "${SERVER_PID}" 2>/dev/null || true
+    wait "${SERVER_PID}" || true
+    trap - INT TERM EXIT
+else
+    echo "Stop with Ctrl+C."
+    exec "${BIN_PATH}" "${COMMON_ARGS[@]}"
+fi

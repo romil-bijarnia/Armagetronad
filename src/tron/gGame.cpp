@@ -63,6 +63,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "gLanguageMenu.h"
 #include "nServerInfo.h"
 #include "gAICharacter.h"
+#include "gTrainedAI.h"
 #include "tDirectories.h"
 #include "gTeam.h"
 #include "eLadderLog.h"
@@ -661,8 +662,27 @@ void gGameSettings::Menu()
      "$game_menu_ais_help",
      numAIs,0,MAXAI);
 
+    uMenuItemToggle trainedAIEnable
+    (&GameSettings,
+     "Blacklight AI (trainable)",
+     "Enable Blacklight neural bot. Disable to use classic built-in bot logic.",
+     gTrainedAI_Enable());
+
+    uMenuItemToggle trainedAILearn
+    (&GameSettings,
+     "Blacklight AI learning",
+     "When enabled, Blacklight updates its model during matches.",
+     gTrainedAI_Learn());
+
+    uMenuItemToggle trainedAIRecord
+    (&GameSettings,
+     "Blacklight AI data recording",
+     "When enabled, Blacklight records gameplay data for offline training later.",
+     gTrainedAI_Record());
+
 
     GameSettings.Enter();
+    gTrainedAI_InstallFactoryIfEnabled();
 }
 
 gGameSettings singlePlayer(10,
@@ -959,6 +979,17 @@ int sg_NumUsers()
 #endif
 }
 
+static bool sg_AIOnlyServerCanRun()
+{
+#ifdef DEDICATED
+    return sn_GetNetState() == nSERVER &&
+           gTrainedAI_Autostart() &&
+           ( multiPlayer.minPlayers > 0 || multiPlayer.numAIs > 0 );
+#else
+    return false;
+#endif
+}
+
 void sg_copySettings()
 {
     eTeam::minTeams					= sg_currentSettings->minTeams;
@@ -1024,7 +1055,7 @@ void update_settings( bool const * goon )
             }
         }
 
-        if ( sg_NumUsers() <= 0 && bool( sg_currentGame ) )
+        if ( sg_NumUsers() <= 0 && !sg_AIOnlyServerCanRun() && bool( sg_currentGame ) )
         {
             sg_currentGame->NoLongerGoOn();
         }
@@ -1032,7 +1063,11 @@ void update_settings( bool const * goon )
         // count the active players
         int humans = sg_NumHumans();
 
-        bool newsg_singlePlayer = (humans<=1);
+        // Dedicated Blacklight self-play autostart is configured through the
+        // normal multiplayer settings. Keep using that settings block even
+        // when no humans are connected so AI-only training matches honor the
+        // training profile instead of silently falling back to SP_* defaults.
+        bool newsg_singlePlayer = !sg_AIOnlyServerCanRun() && ( humans <= 1 );
 #else
         bool newsg_singlePlayer = (sn_GetNetState() == nSTANDALONE);
 #endif
@@ -1553,8 +1588,9 @@ void sg_HostGame(){
     //#ifndef DEBUG
 #ifdef DEDICATED
     static double startTime=tSysTimeFloat();
+    bool const allowAIOnlyAutostart = sg_AIOnlyServerCanRun();
 
-    if ( sg_NumUsers() == 0)
+    if ( sg_NumUsers() == 0 && !allowAIOnlyAutostart )
     {
         cp();
         con << tOutput("$online_activity_napping") << "\n";
@@ -1596,6 +1632,12 @@ void sg_HostGame(){
             con << "Server exiting due to DEDICATED_IDLE after " << (tSysTimeFloat() - startTime)/3600 << " hours.\n";
             uMenu::quickexit = uMenu::QuickExit_Total;
         }
+    }
+    else if ( allowAIOnlyAutostart )
+    {
+        cp();
+        con << "Blacklight self-play autostart enabled. Starting dedicated match without waiting for a human player.\n";
+        sg_Timestamp();
     }
     cp();
 
@@ -3343,7 +3385,7 @@ void gGame::StateUpdate(){
                 // save current players into a file
                 cp();
 
-                if ( sg_NumUsers() <= 0 )
+                if ( sg_NumUsers() <= 0 && !sg_AIOnlyServerCanRun() )
                     goon = 0;
 
                 Analysis(0);
@@ -3810,7 +3852,7 @@ void gGame::Analysis(REAL time){
 
 #ifdef DEDICATED
     //activeHumans
-    if (sg_NumUsers() <= 0)
+    if (sg_NumUsers() <= 0 && !sg_AIOnlyServerCanRun())
         goon = false;
 #endif
 

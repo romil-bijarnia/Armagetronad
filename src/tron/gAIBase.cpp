@@ -39,12 +39,17 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "eFloor.h"
 #include "eDebugLine.h"
 #include "gAICharacter.h"
+#include "gTrainedAI.h"
+#include "tConfiguration.h"
+#include "tDirectories.h"
 #include "tReferenceHolder.h"
 #include "tRandom.h"
 #include "tRecorder.h"
+#include <fstream>
 #include <stdlib.h>
 #include <cstdlib>
 #include <memory>
+#include <string>
 
 #include "nProtoBuf.h"
 
@@ -70,6 +75,135 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #define AI_STATECHANGE       12
 
 static tReferenceHolder< gAIPlayer > sg_AIReferences;
+static tString sg_aiEvalMetricsFile( "" );
+
+namespace
+{
+class gAIEvalMetrics
+{
+public:
+    static gAIEvalMetrics & Get()
+    {
+        static gAIEvalMetrics metrics;
+        return metrics;
+    }
+
+    void RecordEpisode( char const * kind, bool survived, REAL distance )
+    {
+        char const * metricsFile = static_cast< char const * >( sg_aiEvalMetricsFile );
+        if ( !metricsFile || !metricsFile[0] )
+        {
+            return;
+        }
+
+        ++episodes_;
+        if ( survived )
+        {
+            ++wins_;
+        }
+        distanceTotal_ += distance;
+        lastKind_ = kind ? kind : "UNKNOWN";
+
+        bool writeHeader = NeedHeader();
+
+        std::ofstream out;
+        if ( !tDirectories::Var().Open( out, metricsFile, std::ios::app ) )
+        {
+            return;
+        }
+
+        out.setf( std::ios::fixed );
+        out.precision( 6 );
+        if ( writeHeader )
+        {
+            out << "episode,kind,survived,distance,cumulative_win_rate,cumulative_average_distance\n";
+            headerNeeded_ = false;
+        }
+
+        out << episodes_
+            << "," << lastKind_
+            << "," << ( survived ? 1 : 0 )
+            << "," << distance
+            << "," << WinRate()
+            << "," << AverageDistance()
+            << "\n";
+
+        std::string summaryFile = metricsFile;
+        summaryFile += ".latest";
+        std::ofstream summary;
+        if ( tDirectories::Var().Open( summary, summaryFile.c_str(), std::ios::trunc ) )
+        {
+            summary.setf( std::ios::fixed );
+            summary.precision( 6 );
+            summary << "kind " << lastKind_ << "\n";
+            summary << "episodes " << episodes_ << "\n";
+            summary << "wins " << wins_ << "\n";
+            summary << "win_rate " << WinRate() << "\n";
+            summary << "average_distance " << AverageDistance() << "\n";
+            summary << "last_survived " << ( survived ? 1 : 0 ) << "\n";
+            summary << "last_distance " << distance << "\n";
+        }
+    }
+
+private:
+    gAIEvalMetrics()
+        : episodes_( 0 ),
+          wins_( 0 ),
+          distanceTotal_( 0 ),
+          lastKind_( "UNKNOWN" ),
+          headerChecked_( false ),
+          headerNeeded_( true )
+    {
+    }
+
+    bool NeedHeader()
+    {
+        if ( headerChecked_ )
+        {
+            return headerNeeded_;
+        }
+
+        headerChecked_ = true;
+        std::ifstream in;
+        headerNeeded_ = !tDirectories::Var().Open( in, static_cast< char const * >( sg_aiEvalMetricsFile ) );
+        return headerNeeded_;
+    }
+
+    REAL WinRate() const
+    {
+        if ( episodes_ <= 0 )
+        {
+            return 0;
+        }
+
+        return static_cast< REAL >( wins_ ) / static_cast< REAL >( episodes_ );
+    }
+
+    REAL AverageDistance() const
+    {
+        if ( episodes_ <= 0 )
+        {
+            return 0;
+        }
+
+        return distanceTotal_ / static_cast< REAL >( episodes_ );
+    }
+
+    unsigned long long episodes_;
+    unsigned long long wins_;
+    REAL distanceTotal_;
+    std::string lastKind_;
+    bool headerChecked_;
+    bool headerNeeded_;
+};
+
+static void sg_ReportAIEpisode( bool neural, bool survived, REAL distance )
+{
+    gAIEvalMetrics::Get().RecordEpisode( neural ? "BLACKLIGHT" : "CLASSIC", survived, distance );
+}
+}
+
+static tConfItem< tString > sg_aiEvalMetricsFileConf( "AI_EVAL_METRICS_FILE", sg_aiEvalMetricsFile );
 
 #ifdef DEBUG
 //#define TESTSTATE AI_PATH
@@ -112,6 +246,90 @@ static gAITeam* AITeam()
     }
 
     return sg_AITeam;
+}
+
+static int sg_CurrentBotPlayerCount()
+{
+    int total = 0;
+    for ( int i = se_PlayerNetIDs.Len() - 1; i >= 0; --i )
+    {
+        if ( dynamic_cast< gAIPlayer * >( se_PlayerNetIDs( i ) ) )
+        {
+            ++total;
+        }
+    }
+
+    return total;
+}
+
+static int sg_TargetBlacklightAICount()
+{
+    if ( !gTrainedAI_Enable() )
+    {
+        return 0;
+    }
+
+    int totalAIs = sg_CurrentBotPlayerCount();
+    int desired = gTrainedAI_BotCount();
+    if ( desired < 0 )
+    {
+        desired = totalAIs;
+    }
+    if ( desired < 0 )
+    {
+        desired = 0;
+    }
+    if ( desired > totalAIs )
+    {
+        desired = totalAIs;
+    }
+    return desired;
+}
+
+static bool sg_IsManagedAIPlayer( gAIPlayer const * ai )
+{
+    return ai != 0;
+}
+
+static void sg_AssignBlacklightControllers()
+{
+    int desiredCount = sg_TargetBlacklightAICount();
+    if ( desiredCount < 0 )
+    {
+        desiredCount = 0;
+    }
+
+    int assigned = 0;
+
+    for ( int i = se_PlayerNetIDs.Len() - 1; i >= 0; --i )
+    {
+        gAIPlayer * ai = dynamic_cast< gAIPlayer * >( se_PlayerNetIDs( i ) );
+        if ( !sg_IsManagedAIPlayer( ai ) || !ai->UseSimpleAI() )
+        {
+            continue;
+        }
+
+        if ( assigned < desiredCount )
+        {
+            ++assigned;
+        }
+        else
+        {
+            ai->SetUseSimpleAI( false );
+        }
+    }
+
+    for ( int i = se_PlayerNetIDs.Len() - 1; i >= 0 && assigned < desiredCount; --i )
+    {
+        gAIPlayer * ai = dynamic_cast< gAIPlayer * >( se_PlayerNetIDs( i ) );
+        if ( !sg_IsManagedAIPlayer( ai ) || ai->UseSimpleAI() )
+        {
+            continue;
+        }
+
+        ai->SetUseSimpleAI( true );
+        ++assigned;
+    }
 }
 
 static void ClearAITeam()
@@ -332,6 +550,7 @@ void gAITeam::BalanceWithAIs(bool balanceWithAIs)
     }
 
     // get rid of deleted netobjects (teams, mostly)
+    sg_AssignBlacklightControllers();
     nNetObject::ClearAllDeleted();
 }
 
@@ -1103,6 +1322,13 @@ nNetObjectDescriptorBase const & gAIPlayer::DoGetDescriptor() const
 //! creates a netobject form sync data
 gAIPlayer::gAIPlayer( Game::AIPlayerSync const & sync, nSenderInfo const & sender ):
         ePlayerNetID(sync.base(), sender ),
+        simpleAI_(NULL),
+        useSimpleAI_(false),
+        simpleAIResultReported_(false),
+        aiEvalResultReported_(false),
+        hasLastObjectState_( false ),
+        lastObjectAlive_( false ),
+        lastObjectDistance_( 0 ),
         character(NULL),
         //	target(NULL),
         lastPath(se_GameTime()-100),
@@ -1116,6 +1342,12 @@ gAIPlayer::gAIPlayer( Game::AIPlayerSync const & sync, nSenderInfo const & sende
 
 gAIPlayer::gAIPlayer():
         simpleAI_(NULL),
+        useSimpleAI_(false),
+        simpleAIResultReported_(false),
+        aiEvalResultReported_(false),
+        hasLastObjectState_( false ),
+        lastObjectAlive_( false ),
+        lastObjectDistance_( 0 ),
         character(NULL),
         //	target(NULL),
         lastPath(se_GameTime()-100),
@@ -1205,6 +1437,80 @@ gAIPlayer::gAIPlayer():
 void gAIPlayer::ConfigureAIs()  // ai configuration menu
 {
 
+}
+
+void gAIPlayer::SetUseSimpleAI( bool useSimpleAI )
+{
+    useSimpleAI_ = useSimpleAI;
+
+    if ( useSimpleAI_ )
+    {
+        SetName( gTrainedAI_Name() );
+    }
+    else if ( character )
+    {
+        SetName( character->name );
+    }
+}
+
+void gAIPlayer::ControlObject( eNetGameObject * c )
+{
+    bool survived = hasLastObjectState_ ? lastObjectAlive_ : false;
+    REAL distance = hasLastObjectState_ ? lastObjectDistance_ : 0;
+    if ( Object() )
+    {
+        survived = Object()->Alive();
+        distance = Object()->GetDistance();
+    }
+
+    if ( simpleAI_ && !simpleAIResultReported_ )
+    {
+        simpleAI_->OnRoundResult( survived, distance );
+        simpleAIResultReported_ = true;
+    }
+    if ( !aiEvalResultReported_ )
+    {
+        sg_ReportAIEpisode( useSimpleAI_, survived, distance );
+        aiEvalResultReported_ = true;
+    }
+
+    ePlayerNetID::ControlObject( c );
+    simpleAI_ = NULL;
+    simpleAIResultReported_ = false;
+    aiEvalResultReported_ = false;
+    hasLastObjectState_ = false;
+    lastObjectAlive_ = false;
+    lastObjectDistance_ = 0;
+}
+
+void gAIPlayer::ClearObject()
+{
+    bool survived = hasLastObjectState_ ? lastObjectAlive_ : false;
+    REAL distance = hasLastObjectState_ ? lastObjectDistance_ : 0;
+    if ( Object() )
+    {
+        survived = Object()->Alive();
+        distance = Object()->GetDistance();
+    }
+
+    if ( simpleAI_ && !simpleAIResultReported_ )
+    {
+        simpleAI_->OnRoundResult( survived, distance );
+        simpleAIResultReported_ = true;
+    }
+    if ( !aiEvalResultReported_ )
+    {
+        sg_ReportAIEpisode( useSimpleAI_, survived, distance );
+        aiEvalResultReported_ = true;
+    }
+
+    ePlayerNetID::ClearObject();
+    simpleAI_ = NULL;
+    simpleAIResultReported_ = false;
+    aiEvalResultReported_ = false;
+    hasLastObjectState_ = false;
+    lastObjectAlive_ = false;
+    lastObjectDistance_ = 0;
 }
 
 
@@ -1318,8 +1624,8 @@ void gAIPlayer::SetNumberOfAIs(int num, int minPlayers, int iq, int tries)
         {
             // too litte AIs. Create one.
             gAIPlayer *ai = tNEW(gAIPlayer)();
-            ai->SetName( bestIQ->name );
             ai->character = bestIQ;
+            ai->SetUseSimpleAI( false );
 
             sg_AIReferences.Add( ai );
 
@@ -1346,6 +1652,8 @@ void gAIPlayer::SetNumberOfAIs(int num, int minPlayers, int iq, int tries)
     while ((count != 0 ||
             !iqperfect) &&
             tries-- != 0);
+
+    sg_AssignBlacklightControllers();
 
 }
 
@@ -2713,8 +3021,29 @@ void gAIPlayer::RightBeforeDeath(int triesLeft) // is called right before the ve
     if ( nCLIENT == sn_GetNetState() )
         return;
 
+    bool survived = hasLastObjectState_ ? lastObjectAlive_ : false;
+    REAL distance = hasLastObjectState_ ? lastObjectDistance_ : 0;
+    if ( Object() )
+    {
+        survived = Object()->Alive();
+        distance = Object()->GetDistance();
+    }
+
+    if ( !aiEvalResultReported_ )
+    {
+        sg_ReportAIEpisode( useSimpleAI_, false, distance );
+        aiEvalResultReported_ = true;
+    }
+
     if ( simpleAI_ )
+    {
+        if ( !simpleAIResultReported_ )
+        {
+            simpleAI_->OnRoundResult( false, distance );
+            simpleAIResultReported_ = true;
+        }
         return;
+    }
 
     if (!character)
     {
@@ -2821,6 +3150,13 @@ void gAIPlayer::NewObject()         // called when we control a new object
         state           = AI_TRACE;
     }
 
+    if ( gSimpleAIFactory::Get() && useSimpleAI_ )
+    {
+        // Let alternative controllers such as Blacklight act immediately
+        // instead of inheriting the classic AI startup delay.
+        nextTime = lastTime;
+    }
+
     if (log)
         delete log;
     log = NULL;
@@ -2874,12 +3210,13 @@ static gAISensor * sg_GetSensor( int currentDirectionNumber, gCycle const & obje
 }
 
 REAL gAIPlayer::Think(){
-    if ( !simpleAI_ )
+    if ( useSimpleAI_ && !simpleAI_ )
     {
         gSimpleAIFactory * factory = gSimpleAIFactory::Get();
         if ( factory )
         {
             simpleAI_ = factory->Create( Object() );
+            simpleAIResultReported_ = false;
         }
     }
 
@@ -3107,6 +3444,28 @@ void gAIPlayer::ActOnData( ThinkDataBase & data )
 const REAL relax=25;
 
 void gAIPlayer::Timestep(REAL time){
+    if ( Object() )
+    {
+        hasLastObjectState_ = true;
+        lastObjectAlive_ = Object()->Alive();
+        lastObjectDistance_ = Object()->GetDistance();
+    }
+
+    if ( gSimpleAIFactory::Get() && useSimpleAI_ )
+    {
+        if ( bool(Object()) && Object()->Alive() )
+        {
+            lastTime = time;
+            REAL nextthought = Think();
+            if ( nextthought < 0.01f )
+            {
+                nextthought = 0.01f;
+            }
+            nextTime = time + nextthought;
+        }
+        return;
+    }
+
     if (!character)
     {
         st_Breakpoint();
