@@ -201,7 +201,7 @@ UPLOAD_SCP=${UPLOAD_SCP_BASE}${SF_DIR}/
 # steam: no configurable data here, look into ../build/context/steamcontentbuilder
 # required secrets: script steamuser.sh, content
 # STEAM_USER=<steam username authorized to upload packages>
-# STEAM_PASSWORD=<their password>
+# STEAM_PASSWORD=<their password> (only for first login to get Steam Guard token, not used in CI)
 # 
 # file config.vdf optained after the first failed login due to Steam Guard, see deploy_steam.sh script
 
@@ -213,7 +213,10 @@ LP_PROJECT=armagetronad
 LP_VERSION=`echo @version@ | sed -e s/_/-/g`
 
 # Launchpad uploads require an authentication token in the plain text file secrets/lp-credentials.
-# Just run lp-project-upload with some garbage parameters, log in, and it will be created for you.
+# Just do
+#   export LP_CREDENTIALS_FILE=./secrets/lp-credentials
+#   lp-project-upload fjsdfl345 0 fgjkldftglkj
+# log in, and it will be created for you.
 # To GPG-sign the uploads, provide gpg keys in secrets/pub.gpg and secrets/sec.gpg.
 
 # **********************************************************************
