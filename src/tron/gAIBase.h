@@ -103,6 +103,7 @@ class gAIPlayer: public ePlayerNetID{
 protected:
     gSimpleAI *simpleAI_;
     bool useSimpleAI_;
+    bool roundUsesSimpleAI_;
     bool simpleAIResultReported_;
     bool aiEvalResultReported_;
     bool hasLastObjectState_;

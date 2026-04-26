@@ -30,6 +30,11 @@ int & gTrainedAI_BotCount();
 //! this project uses one shared neural AI identity: "Blacklight"
 char const * gTrainedAI_Name();
 
+//! Record a classic bot decision as a supervised teacher example.
+void gTrainedAI_RecordTeacherDecision( gCycle * cycle, int turn );
+//! Close out the current teacher episode for a classic bot.
+void gTrainedAI_RecordTeacherEpisodeResult( gCycle * cycle, bool survived, REAL distance );
+
 //! installs the trained AI factory when enabled via configuration
 void gTrainedAI_InstallFactoryIfEnabled();
 

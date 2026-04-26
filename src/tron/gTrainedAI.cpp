@@ -20,6 +20,7 @@ of the License, or (at your option) any later version.
 
 #include "eGrid.h"
 #include "gSensor.h"
+#include "gWall.h"
 #include "tConfiguration.h"
 #include "tConsole.h"
 #include "tDirectories.h"
@@ -30,6 +31,7 @@ of the License, or (at your option) any later version.
 #include <iomanip>
 #include <fstream>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -38,74 +40,29 @@ namespace
 {
 enum
 {
-    kBaseFeatures = 44,
-    kHistoryFrames = 250,
-    kCurrentFrameOffset = ( kHistoryFrames - 1 ) * kBaseFeatures,
-    kFeatures = kBaseFeatures * kHistoryFrames,
-    kTemporalHidden = 4096,
-    kHidden1 = 1024,
-    kHidden2 = 512,
-    kHidden3 = 256,
+    kTeacherScalarFeatures = 6,
+    kTeacherMapSize = 25,
+    kTeacherMapChannels = 7,
+    kTeacherMapCells = kTeacherMapSize * kTeacherMapSize,
+    kFeatures = kTeacherScalarFeatures + kTeacherMapSize * kTeacherMapSize * kTeacherMapChannels,
+    kConv1Channels = 32,
+    kConv2Channels = 64,
+    kConvKernelSize = 3,
+    kDenseInput = kTeacherScalarFeatures + kTeacherMapCells * kConv2Channels,
+    kHidden1 = 256,
+    kHidden2 = 128,
     kActions = 3
 };
 
 enum
 {
     kParameterCount =
-        kFeatures * kTemporalHidden + kTemporalHidden +
-        kTemporalHidden * kHidden1 + kHidden1 +
+        kConv1Channels * kTeacherMapChannels * kConvKernelSize * kConvKernelSize + kConv1Channels +
+        kConv2Channels * kConv1Channels * kConvKernelSize * kConvKernelSize + kConv2Channels +
+        kDenseInput * kHidden1 + kHidden1 +
         kHidden1 * kHidden2 + kHidden2 +
-        kHidden2 * kHidden3 + kHidden3 +
-        kActions * kHidden3 + kActions +
-        kHidden3 + 1
-};
-
-enum FeatureIndex
-{
-    kBias = 0,
-    kFront,
-    kFrontNarrowLeft,
-    kFrontNarrowRight,
-    kFrontLeft,
-    kFrontRight,
-    kWideLeft,
-    kWideRight,
-    kLeft,
-    kRight,
-    kBackLeft,
-    kBackRight,
-    kBack,
-    kSpeed,
-    kCanLeft,
-    kCanRight,
-    kTurnDelay,
-    kEnemyAhead,
-    kEnemySide,
-    kEnemyNear,
-    kEnemySpeedDiff,
-    kEnemyHeadingDot,
-    kEnemyCrossing,
-    kEnemyFrontProximity,
-    kEnemyBearingDrift,
-    kFrontEnemyWall,
-    kFrontRimWall,
-    kLeftEnemyWall,
-    kRightEnemyWall,
-    kLeftRimWall,
-    kRightRimWall,
-    kLeftRightBalance,
-    kFrontPressure,
-    kBackPressure,
-    kWallCrowding,
-    kForwardArcSafety,
-    kSideArcSafety,
-    kEnemyClosing,
-    kEnemyLateralClosing,
-    kEnemyBackProximity,
-    kSpeedPressure,
-    kEscapeLeft,
-    kEscapeRight,
-    kEscapeRouteBias
+        kActions * kHidden2 + kActions +
+        kHidden2 + 1
 };
 
 static bool sg_enable = false;
@@ -118,8 +75,9 @@ static bool sg_offlineTrain = false;
 // bot players are controlled by Blacklight when classic bots are also present.
 static int sg_botCount = -1;
 static char const * const sg_aiName = "Blacklight";
-static tString sg_modelFile( "trained_ai_model.txt" );
+static tString sg_modelFile( "trained_ai_teacher_cnn_model.txt" );
 static tString sg_recordFile( "trained_ai_experience.log" );
+static tString sg_teacherFile( "trained_ai_teacher_examples.log" );
 static tString sg_metricsFile( "trained_ai_metrics.csv" );
 static tString sg_checkpointPrefix( "trained_ai_checkpoints/blacklight" );
 static tString sg_offlineSourceList( "" );
@@ -152,6 +110,17 @@ static REAL sg_policyHistoricProb = .35f;
 static REAL sg_rewardDistance = .002f;
 static REAL sg_rewardWin = 2.0f;
 static REAL sg_rewardDeath = -2.0f;
+
+enum TeacherMapChannel
+{
+    kTeacherSelfWall = 0,
+    kTeacherTeamWall,
+    kTeacherEnemyWall,
+    kTeacherRimWall,
+    kTeacherSelfCycle,
+    kTeacherTeamCycle,
+    kTeacherEnemyCycle
+};
 
 static REAL Clamp( REAL value, REAL low, REAL high )
 {
@@ -194,19 +163,289 @@ static int ActionToTurn( int action )
     return 0;
 }
 
+static int TurnToAction( int turn )
+{
+    if ( turn < 0 ) return 0;
+    if ( turn > 0 ) return 2;
+    return 1;
+}
+
+static REAL ComputeLookAhead( gCycle * cycle )
+{
+    REAL speed = cycle ? cycle->Speed() : 0;
+    if ( speed < .1f ) speed = .1f;
+    REAL lookAhead = speed * Clamp( sg_lookAheadSeconds, .2f, 20.0f );
+    if ( lookAhead < 8.0f ) lookAhead = 8.0f;
+    return lookAhead;
+}
+
+static eCoord ToCycleLocalSpace( gCycle * cycle, eCoord const & worldPoint )
+{
+    if ( !cycle )
+    {
+        return eCoord( 0, 0 );
+    }
+
+    return ( worldPoint - cycle->Position() ).Turn( cycle->Direction().Conj() ).Turn( 0, 1 );
+}
+
 struct Step
 {
     REAL x[kFeatures];
-    REAL h0[kTemporalHidden];
-    REAL h1[kHidden1];
-    REAL h2[kHidden2];
-    REAL h3[kHidden3];
     REAL p[kActions];
     REAL v;
     int action;
     bool canLeft;
     bool canRight;
 };
+
+struct LearningStats
+{
+    LearningStats()
+        : policyLoss( 0 ),
+          valueLoss( 0 ),
+          entropy( 0 ),
+          steps( 0 ),
+          valid( false )
+    {
+    }
+
+    REAL policyLoss;
+    REAL valueLoss;
+    REAL entropy;
+    unsigned int steps;
+    bool valid;
+};
+
+struct TeacherEpisodeState
+{
+    TeacherEpisodeState()
+        : episodeId( 0 ),
+          stepIndex( 0 )
+    {
+    }
+
+    unsigned long long episodeId;
+    unsigned int stepIndex;
+};
+
+struct TeacherExample
+{
+    TeacherExample()
+        : action( 1 ),
+          canLeft( false ),
+          canRight( false ),
+          halfExtent( 0 )
+    {
+        for ( int i = 0; i < kTeacherScalarFeatures; ++i )
+        {
+            scalars[i] = 0;
+        }
+        for ( int channel = 0; channel < kTeacherMapChannels; ++channel )
+            for ( int y = 0; y < kTeacherMapSize; ++y )
+                for ( int x = 0; x < kTeacherMapSize; ++x )
+                    map[channel][y][x] = 0;
+    }
+
+    int action;
+    bool canLeft;
+    bool canRight;
+    REAL halfExtent;
+    REAL scalars[kTeacherScalarFeatures];
+    REAL map[kTeacherMapChannels][kTeacherMapSize][kTeacherMapSize];
+};
+
+static unsigned long long sg_teacherEpisodeId = 0;
+static std::map< gCycle const *, TeacherEpisodeState > sg_teacherEpisodes;
+static std::set< eWall * > * sg_teacherWallCollector = 0;
+
+static void CollectTeacherWall( eWall * wall )
+{
+    if ( sg_teacherWallCollector && wall )
+    {
+        sg_teacherWallCollector->insert( wall );
+    }
+}
+
+static void MarkTeacherCell( TeacherExample & example, int channel, int x, int y, REAL value = 1.0f )
+{
+    if ( channel < 0 || channel >= kTeacherMapChannels ) return;
+    if ( x < 0 || x >= kTeacherMapSize ) return;
+    if ( y < 0 || y >= kTeacherMapSize ) return;
+    if ( value > example.map[channel][y][x] )
+    {
+        example.map[channel][y][x] = value;
+    }
+}
+
+static bool LocalToTeacherCell( eCoord const & local, REAL halfExtent, int & x, int & y )
+{
+    if ( halfExtent <= 0 )
+    {
+        return false;
+    }
+
+    REAL cellSize = ( halfExtent * 2.0f ) / static_cast< REAL >( kTeacherMapSize );
+    if ( cellSize <= 0 )
+    {
+        return false;
+    }
+
+    REAL fx = ( local.x + halfExtent ) / cellSize;
+    REAL fy = ( halfExtent - local.y ) / cellSize;
+    x = static_cast< int >( std::floor( fx ) );
+    y = static_cast< int >( std::floor( fy ) );
+    return x >= 0 && x < kTeacherMapSize && y >= 0 && y < kTeacherMapSize;
+}
+
+static void RasterizeTeacherSegment( TeacherExample & example, int channel, eCoord const & localStart, eCoord const & localEnd )
+{
+    REAL span = std::max( std::fabs( localEnd.x - localStart.x ), std::fabs( localEnd.y - localStart.y ) );
+    REAL cellSize = ( example.halfExtent * 2.0f ) / static_cast< REAL >( kTeacherMapSize );
+    int steps = cellSize > 0 ? static_cast< int >( std::ceil( span / cellSize ) ) : 1;
+    if ( steps < 1 ) steps = 1;
+    steps *= 2;
+
+    for ( int i = 0; i <= steps; ++i )
+    {
+        REAL t = static_cast< REAL >( i ) / static_cast< REAL >( steps );
+        eCoord local = localStart * ( 1.0f - t ) + localEnd * t;
+        int x = 0;
+        int y = 0;
+        if ( LocalToTeacherCell( local, example.halfExtent, x, y ) )
+        {
+            MarkTeacherCell( example, channel, x, y );
+        }
+    }
+}
+
+static TeacherEpisodeState & GetTeacherEpisodeState( gCycle * cycle )
+{
+    TeacherEpisodeState & state = sg_teacherEpisodes[cycle];
+    if ( state.episodeId == 0 )
+    {
+        state.episodeId = ++sg_teacherEpisodeId;
+        state.stepIndex = 0;
+    }
+    return state;
+}
+
+static void BuildTeacherExample( gCycle * cycle, int turn, TeacherExample & example )
+{
+    if ( !cycle ) return;
+
+    REAL speed = cycle->Speed();
+    if ( speed < .1f ) speed = .1f;
+    REAL lookAhead = ComputeLookAhead( cycle );
+    REAL halfExtent = Clamp( lookAhead * 1.5f, 18.0f, 80.0f );
+    bool canLeft = cycle->CanMakeTurn( -1 );
+    bool canRight = cycle->CanMakeTurn( 1 );
+
+    example.action = TurnToAction( turn );
+    example.canLeft = canLeft;
+    example.canRight = canRight;
+    example.halfExtent = halfExtent;
+    example.scalars[0] = speed / ( speed + 20.0f );
+    example.scalars[1] = Clamp( cycle->GetTurnDelay() / ( sg_lookAheadSeconds + .1f ), 0.0f, 1.0f );
+    example.scalars[2] = canLeft ? 1.0f : 0.0f;
+    example.scalars[3] = canRight ? 1.0f : 0.0f;
+    example.scalars[4] = Clamp( lookAhead / ( lookAhead + 20.0f ), 0.0f, 1.0f );
+    example.scalars[5] = Clamp( halfExtent / ( halfExtent + 40.0f ), 0.0f, 1.0f );
+
+    MarkTeacherCell( example, kTeacherSelfCycle, kTeacherMapSize / 2, kTeacherMapSize / 2 );
+
+    if ( cycle->Grid() )
+    {
+        std::set< eWall * > nearbyWalls;
+        sg_teacherWallCollector = &nearbyWalls;
+        cycle->Grid()->ProcessWallsInRange(
+            &CollectTeacherWall,
+            cycle->Position(),
+            halfExtent * 1.5f,
+            cycle->CurrentFace() );
+        sg_teacherWallCollector = 0;
+
+        for ( std::set< eWall * >::const_iterator it = nearbyWalls.begin(); it != nearbyWalls.end(); ++it )
+        {
+            eWall * wall = *it;
+            if ( !wall ) continue;
+
+            int channel = kTeacherRimWall;
+            if ( gPlayerWall * playerWall = dynamic_cast< gPlayerWall * >( wall ) )
+            {
+                gCycle * owner = playerWall->Cycle();
+                if ( owner && owner == cycle )
+                {
+                    channel = kTeacherSelfWall;
+                }
+                else if ( owner && owner->Team() == cycle->Team() )
+                {
+                    channel = kTeacherTeamWall;
+                }
+                else
+                {
+                    channel = kTeacherEnemyWall;
+                }
+            }
+
+            eCoord localStart = ToCycleLocalSpace( cycle, wall->EndPoint( 0 ) );
+            eCoord localEnd = ToCycleLocalSpace( cycle, wall->EndPoint( 1 ) );
+            RasterizeTeacherSegment( example, channel, localStart, localEnd );
+        }
+
+        const tList< eGameObject > & gameObjects = cycle->Grid()->GameObjects();
+        for ( int i = gameObjects.Len() - 1; i >= 0; --i )
+        {
+            gCycle * other = dynamic_cast< gCycle * >( gameObjects( i ) );
+            if ( !other || !other->Alive() ) continue;
+
+            int channel = kTeacherEnemyCycle;
+            if ( other == cycle )
+            {
+                channel = kTeacherSelfCycle;
+            }
+            else if ( other->Team() == cycle->Team() )
+            {
+                channel = kTeacherTeamCycle;
+            }
+
+            int x = 0;
+            int y = 0;
+            if ( LocalToTeacherCell( ToCycleLocalSpace( cycle, other->Position() ), halfExtent, x, y ) )
+            {
+                MarkTeacherCell( example, channel, x, y );
+            }
+        }
+    }
+}
+
+static void FlattenTeacherExample( TeacherExample const & example, REAL x[kFeatures] )
+{
+    int index = 0;
+    for ( int i = 0; i < kTeacherScalarFeatures; ++i )
+    {
+        x[index++] = example.scalars[i];
+    }
+
+    for ( int channel = 0; channel < kTeacherMapChannels; ++channel )
+        for ( int y = 0; y < kTeacherMapSize; ++y )
+            for ( int cellX = 0; cellX < kTeacherMapSize; ++cellX )
+                x[index++] = example.map[channel][y][cellX];
+}
+
+static void UnpackTeacherInput( REAL const x[kFeatures], REAL scalars[kTeacherScalarFeatures], REAL map[kTeacherMapChannels][kTeacherMapSize][kTeacherMapSize] )
+{
+    int index = 0;
+    for ( int i = 0; i < kTeacherScalarFeatures; ++i )
+    {
+        scalars[i] = x[index++];
+    }
+
+    for ( int channel = 0; channel < kTeacherMapChannels; ++channel )
+        for ( int y = 0; y < kTeacherMapSize; ++y )
+            for ( int cellX = 0; cellX < kTeacherMapSize; ++cellX )
+                map[channel][y][cellX] = x[index++];
+}
 
 static unsigned long long sg_recordEpisodeId = 0;
 
@@ -276,7 +515,7 @@ public:
         return metrics;
     }
 
-    void RecordEpisode( bool survived, REAL distance, REAL reward, REAL averagePredictedValue, unsigned int steps, bool learned, unsigned int policyEpisodes, unsigned int policyUpdates )
+    void RecordEpisode( bool survived, REAL distance, REAL reward, REAL averagePredictedValue, unsigned int steps, LearningStats const & learningStats, bool learned, unsigned int policyEpisodes, unsigned int policyUpdates )
     {
         char const * metricsFile = static_cast< char const * >( sg_metricsFile );
         if ( !metricsFile || !metricsFile[0] )
@@ -293,6 +532,16 @@ public:
         distanceTotal_ += distance;
         predictedValueTotal_ += averagePredictedValue;
         stepsTotal_ += steps;
+        if ( learningStats.valid )
+        {
+            ++learnedEpisodes_;
+            policyLossTotal_ += learningStats.policyLoss;
+            valueLossTotal_ += learningStats.valueLoss;
+            entropyTotal_ += learningStats.entropy;
+            lastPolicyLoss_ = learningStats.policyLoss;
+            lastValueLoss_ = learningStats.valueLoss;
+            lastEntropy_ = learningStats.entropy;
+        }
 
         bool writeHeader = NeedHeader();
 
@@ -307,7 +556,7 @@ public:
 
         if ( writeHeader )
         {
-            out << "episode,survived,reward,distance,average_predicted_value,steps,learned,policy_episodes,policy_updates,cumulative_win_rate,cumulative_average_reward,cumulative_average_distance,cumulative_average_predicted_value\n";
+            out << "episode,survived,reward,distance,average_predicted_value,steps,learned,policy_episodes,policy_updates,cumulative_win_rate,cumulative_average_reward,cumulative_average_distance,cumulative_average_predicted_value,policy_loss,value_loss,entropy,cumulative_average_policy_loss,cumulative_average_value_loss,cumulative_average_entropy\n";
             headerNeeded_ = false;
         }
 
@@ -324,19 +573,32 @@ public:
             << "," << AverageReward()
             << "," << AverageDistance()
             << "," << AveragePredictedValue()
+            << "," << ( learningStats.valid ? learningStats.policyLoss : 0 )
+            << "," << ( learningStats.valid ? learningStats.valueLoss : 0 )
+            << "," << ( learningStats.valid ? learningStats.entropy : 0 )
+            << "," << AveragePolicyLoss()
+            << "," << AverageValueLoss()
+            << "," << AverageEntropy()
             << "\n";
 
-        WriteSummary( survived, distance, reward, averagePredictedValue, steps, learned, policyEpisodes, policyUpdates );
+        WriteSummary( survived, distance, reward, averagePredictedValue, steps, learningStats, learned, policyEpisodes, policyUpdates );
     }
 
 private:
     TrainingMetrics()
         : episodes_( 0 ),
           wins_( 0 ),
+          learnedEpisodes_( 0 ),
           rewardTotal_( 0 ),
           distanceTotal_( 0 ),
           predictedValueTotal_( 0 ),
           stepsTotal_( 0 ),
+          policyLossTotal_( 0 ),
+          valueLossTotal_( 0 ),
+          entropyTotal_( 0 ),
+          lastPolicyLoss_( 0 ),
+          lastValueLoss_( 0 ),
+          lastEntropy_( 0 ),
           headerChecked_( false ),
           headerNeeded_( true )
     {
@@ -405,7 +667,37 @@ private:
         return static_cast< REAL >( stepsTotal_ ) / static_cast< REAL >( episodes_ );
     }
 
-    void WriteSummary( bool survived, REAL distance, REAL reward, REAL averagePredictedValue, unsigned int steps, bool learned, unsigned int policyEpisodes, unsigned int policyUpdates )
+    REAL AveragePolicyLoss() const
+    {
+        if ( learnedEpisodes_ <= 0 )
+        {
+            return 0;
+        }
+
+        return policyLossTotal_ / static_cast< REAL >( learnedEpisodes_ );
+    }
+
+    REAL AverageValueLoss() const
+    {
+        if ( learnedEpisodes_ <= 0 )
+        {
+            return 0;
+        }
+
+        return valueLossTotal_ / static_cast< REAL >( learnedEpisodes_ );
+    }
+
+    REAL AverageEntropy() const
+    {
+        if ( learnedEpisodes_ <= 0 )
+        {
+            return 0;
+        }
+
+        return entropyTotal_ / static_cast< REAL >( learnedEpisodes_ );
+    }
+
+    void WriteSummary( bool survived, REAL distance, REAL reward, REAL averagePredictedValue, unsigned int steps, LearningStats const & learningStats, bool learned, unsigned int policyEpisodes, unsigned int policyUpdates )
     {
         std::string summaryFile = static_cast< char const * >( sg_metricsFile );
         summaryFile += ".latest";
@@ -425,11 +717,19 @@ private:
         out << "average_distance " << AverageDistance() << "\n";
         out << "average_predicted_value " << AveragePredictedValue() << "\n";
         out << "average_steps " << AverageSteps() << "\n";
+        out << "steps_total " << stepsTotal_ << "\n";
+        out << "learned_episodes " << learnedEpisodes_ << "\n";
+        out << "average_policy_loss " << AveragePolicyLoss() << "\n";
+        out << "average_value_loss " << AverageValueLoss() << "\n";
+        out << "average_entropy " << AverageEntropy() << "\n";
         out << "last_survived " << ( survived ? 1 : 0 ) << "\n";
         out << "last_reward " << reward << "\n";
         out << "last_distance " << distance << "\n";
         out << "last_average_predicted_value " << averagePredictedValue << "\n";
         out << "last_steps " << steps << "\n";
+        out << "last_policy_loss " << ( learningStats.valid ? learningStats.policyLoss : lastPolicyLoss_ ) << "\n";
+        out << "last_value_loss " << ( learningStats.valid ? learningStats.valueLoss : lastValueLoss_ ) << "\n";
+        out << "last_entropy " << ( learningStats.valid ? learningStats.entropy : lastEntropy_ ) << "\n";
         out << "last_learned " << ( learned ? 1 : 0 ) << "\n";
         out << "policy_episodes " << policyEpisodes << "\n";
         out << "policy_updates " << policyUpdates << "\n";
@@ -437,10 +737,17 @@ private:
 
     unsigned long long episodes_;
     unsigned long long wins_;
+    unsigned long long learnedEpisodes_;
     REAL rewardTotal_;
     REAL distanceTotal_;
     REAL predictedValueTotal_;
     unsigned long long stepsTotal_;
+    REAL policyLossTotal_;
+    REAL valueLossTotal_;
+    REAL entropyTotal_;
+    REAL lastPolicyLoss_;
+    REAL lastValueLoss_;
+    REAL lastEntropy_;
     bool headerChecked_;
     bool headerNeeded_;
 };
@@ -510,10 +817,17 @@ public:
         Save( true );
     }
 
-    int Choose( int viewIndex, REAL const x[kFeatures], bool canLeft, bool canRight, REAL h0[kTemporalHidden], REAL h1[kHidden1], REAL h2[kHidden2], REAL h3[kHidden3], REAL p[kActions], REAL & v )
+    int Choose( int viewIndex, REAL const x[kFeatures], bool canLeft, bool canRight, REAL p[kActions], REAL & v )
     {
         EnsureLoaded();
-        Forward( GetView( viewIndex ), x, canLeft, canRight, h0, h1, h2, h3, p, v );
+
+        ForwardCache cache;
+        Forward( GetView( viewIndex ), x, canLeft, canRight, cache );
+        for ( int a = 0; a < kActions; ++a )
+        {
+            p[a] = cache.p[a];
+        }
+        v = cache.v;
 
         int greedy = 0;
         for ( int a = 1; a < kActions; ++a )
@@ -531,14 +845,16 @@ public:
         return greedy;
     }
 
-    void Train( std::vector< Step > const & episode, REAL reward )
+    LearningStats Train( std::vector< Step > const & episode, REAL reward )
     {
+        LearningStats stats;
         EnsureLoaded();
-        if ( episode.empty() ) return;
+        if ( episode.empty() ) return stats;
 
         REAL lr = Clamp( sg_learningRate, 0.0f, 1.0f );
-        if ( lr <= 0 ) return;
+        if ( lr <= 0 ) return stats;
 
+        REAL baselineReward = baseline_;
         REAL bDecay = Clamp( sg_baselineDecay, 0.0001f, 1.0f );
         baseline_ = baseline_ * ( 1.0f - bDecay ) + reward * bDecay;
 
@@ -546,26 +862,26 @@ public:
         std::vector< REAL > returns( steps, 0 );
         std::vector< REAL > advantages( steps, 0 );
         REAL discount = Clamp( sg_discount, 0.0f, 1.0f );
-        REAL discounted = reward;
+        REAL discountedReturn = reward;
+        REAL discountedBaseline = baselineReward;
         for ( int t = steps - 1; t >= 0; --t )
         {
-            returns[t] = discounted;
-            advantages[t] = returns[t] - episode[t].v;
-            discounted *= discount;
+            returns[t] = discountedReturn;
+            advantages[t] = returns[t] - discountedBaseline;
+            discountedReturn *= discount;
+            discountedBaseline *= discount;
         }
 
-        REAL mean = 0;
-        for ( int t = 0; t < steps; ++t ) mean += advantages[t];
-        mean /= static_cast< REAL >( steps );
-
-        REAL variance = 0;
+        REAL meanSquare = 0;
         for ( int t = 0; t < steps; ++t )
         {
-            REAL d = advantages[t] - mean;
-            variance += d * d;
+            meanSquare += advantages[t] * advantages[t];
         }
-        variance /= static_cast< REAL >( steps );
-        REAL invStd = variance > 1E-8f ? 1.0f / std::sqrt( variance + 1E-6f ) : 1.0f;
+        meanSquare /= static_cast< REAL >( steps );
+        REAL invRms = meanSquare > 1E-8f ? 1.0f / std::sqrt( meanSquare + 1E-6f ) : 1.0f;
+        REAL policyLossTotal = 0;
+        REAL valueLossTotal = 0;
+        REAL entropyTotal = 0;
 
         int epochs = sg_trainEpochs < 1 ? 1 : sg_trainEpochs;
         for ( int epoch = 0; epoch < epochs; ++epoch )
@@ -573,118 +889,43 @@ public:
             for ( int t = 0; t < steps; ++t )
             {
                 Step const & s = episode[t];
-                REAL normalizedAdvantage = ( advantages[t] - mean ) * invStd;
-                REAL scale = lr * normalizedAdvantage / static_cast< REAL >( steps * epochs );
+                REAL normalizedAdvantage = Clamp( advantages[t] * invRms, -4.0f, 4.0f );
+                REAL policyScale = lr * normalizedAdvantage / static_cast< REAL >( steps * epochs );
 
-                REAL h0[kTemporalHidden];
-                REAL h1[kHidden1];
-                REAL h2[kHidden2];
-                REAL h3[kHidden3];
-                REAL p[kActions];
-                REAL v = 0;
-                Forward( CurrentView(), s.x, s.canLeft, s.canRight, h0, h1, h2, h3, p, v );
+                ForwardCache cache;
+                Forward( CurrentView(), s.x, s.canLeft, s.canRight, cache );
 
-                REAL valueError = returns[t] - v;
+                REAL valueError = Clamp( returns[t] - cache.v, -4.0f, 4.0f );
+                if ( epoch == 0 )
+                {
+                    REAL probability = cache.p[s.action];
+                    if ( probability < 1E-6f )
+                    {
+                        probability = 1E-6f;
+                    }
+
+                    policyLossTotal += -normalizedAdvantage * std::log( probability );
+                    valueLossTotal += 0.5f * valueError * valueError;
+
+                    REAL stepEntropy = 0;
+                    for ( int a = 0; a < kActions; ++a )
+                    {
+                        if ( cache.p[a] > 1E-6f )
+                        {
+                            stepEntropy += -cache.p[a] * std::log( cache.p[a] );
+                        }
+                    }
+                    entropyTotal += stepEntropy;
+                }
+
                 REAL valueScale = Clamp( sg_valueLearningRate, 0.0f, 1.0f ) * valueError / static_cast< REAL >( steps * epochs );
-                if ( scale == 0 && valueScale == 0 ) continue;
+                if ( policyScale == 0 && valueScale == 0 ) continue;
 
-                REAL d4[kActions];
-                for ( int a = 0; a < kActions; ++a )
-                {
-                    REAL target = ( a == s.action ) ? 1.0f : 0.0f;
-                    d4[a] = ( target - p[a] ) * scale;
-                }
-
-                REAL d3[kHidden3];
-                for ( int k = 0; k < kHidden3; ++k )
-                {
-                    REAL back = valueScale * w5_[k];
-                    for ( int a = 0; a < kActions; ++a ) back += d4[a] * w4_[a][k];
-                    d3[k] = ( 1.0f - h3[k] * h3[k] ) * back;
-                }
-
-                REAL d2[kHidden2];
-                for ( int j = 0; j < kHidden2; ++j )
-                {
-                    REAL back = 0;
-                    for ( int k = 0; k < kHidden3; ++k ) back += d3[k] * w3_[k][j];
-                    d2[j] = ( 1.0f - h2[j] * h2[j] ) * back;
-                }
-
-                REAL d1[kHidden1];
-                for ( int j = 0; j < kHidden1; ++j )
-                {
-                    REAL back = 0;
-                    for ( int k = 0; k < kHidden2; ++k ) back += d2[k] * w2_[k][j];
-                    d1[j] = ( 1.0f - h1[j] * h1[j] ) * back;
-                }
-
-                REAL d0[kTemporalHidden];
-                for ( int j = 0; j < kTemporalHidden; ++j )
-                {
-                    REAL back = 0;
-                    for ( int k = 0; k < kHidden1; ++k ) back += d1[k] * w1_[k][j];
-                    d0[j] = ( 1.0f - h0[j] * h0[j] ) * back;
-                }
-
-                for ( int a = 0; a < kActions; ++a )
-                {
-                    b4_[a] += d4[a];
-                    for ( int k = 0; k < kHidden3; ++k ) w4_[a][k] += d4[a] * h3[k];
-                }
-
-                b5_ += valueScale;
-                for ( int k = 0; k < kHidden3; ++k ) w5_[k] += valueScale * h3[k];
-
-                for ( int k = 0; k < kHidden3; ++k )
-                {
-                    b3_[k] += d3[k];
-                    for ( int j = 0; j < kHidden2; ++j ) w3_[k][j] += d3[k] * h2[j];
-                }
-
-                for ( int k = 0; k < kHidden2; ++k )
-                {
-                    b2_[k] += d2[k];
-                    for ( int j = 0; j < kHidden1; ++j ) w2_[k][j] += d2[k] * h1[j];
-                }
-
-                for ( int j = 0; j < kHidden1; ++j )
-                {
-                    b1_[j] += d1[j];
-                    for ( int i = 0; i < kTemporalHidden; ++i ) w1_[j][i] += d1[j] * h0[i];
-                }
-
-                for ( int j = 0; j < kTemporalHidden; ++j )
-                {
-                    b0_[j] += d0[j];
-                    for ( int i = 0; i < kFeatures; ++i ) w0_[j][i] += d0[j] * s.x[i];
-                }
+                Backward( cache, s.action, policyScale, valueScale );
             }
         }
 
-        REAL shrink = 1.0f - lr * Clamp( sg_weightDecay, 0.0f, 1.0f );
-        for ( int j = 0; j < kTemporalHidden; ++j )
-            for ( int i = 0; i < kFeatures; ++i )
-                w0_[j][i] = Clamp( w0_[j][i] * shrink, -sg_weightClip, sg_weightClip );
-
-        for ( int j = 0; j < kHidden1; ++j )
-            for ( int i = 0; i < kTemporalHidden; ++i )
-                w1_[j][i] = Clamp( w1_[j][i] * shrink, -sg_weightClip, sg_weightClip );
-
-        for ( int k = 0; k < kHidden2; ++k )
-            for ( int j = 0; j < kHidden1; ++j )
-                w2_[k][j] = Clamp( w2_[k][j] * shrink, -sg_weightClip, sg_weightClip );
-
-        for ( int k = 0; k < kHidden3; ++k )
-            for ( int j = 0; j < kHidden2; ++j )
-                w3_[k][j] = Clamp( w3_[k][j] * shrink, -sg_weightClip, sg_weightClip );
-
-        for ( int a = 0; a < kActions; ++a )
-            for ( int k = 0; k < kHidden3; ++k )
-                w4_[a][k] = Clamp( w4_[a][k] * shrink, -sg_weightClip, sg_weightClip );
-
-        for ( int k = 0; k < kHidden3; ++k )
-            w5_[k] = Clamp( w5_[k] * shrink, -sg_weightClip, sg_weightClip );
+        ApplyWeightDecay( lr );
 
         ++episodes_;
         ++updates_;
@@ -693,88 +934,190 @@ public:
         MaybeWriteCheckpoint();
         if ( sg_saveEvery < 1 ) sg_saveEvery = 1;
         if ( episodes_ % static_cast< unsigned int >( sg_saveEvery ) == 0 ) Save();
+        stats.policyLoss = policyLossTotal / static_cast< REAL >( steps );
+        stats.valueLoss = valueLossTotal / static_cast< REAL >( steps );
+        stats.entropy = entropyTotal / static_cast< REAL >( steps );
+        stats.steps = static_cast< unsigned int >( steps );
+        stats.valid = true;
+        return stats;
+    }
+
+    LearningStats TrainTeacher( std::vector< Step > const & episode )
+    {
+        LearningStats stats;
+        EnsureLoaded();
+        if ( episode.empty() ) return stats;
+
+        REAL lr = Clamp( sg_learningRate, 0.0f, 1.0f );
+        if ( lr <= 0 ) return stats;
+
+        REAL policyLossTotal = 0;
+        REAL entropyTotal = 0;
+        int steps = static_cast< int >( episode.size() );
+        int epochs = sg_trainEpochs < 1 ? 1 : sg_trainEpochs;
+
+        for ( int epoch = 0; epoch < epochs; ++epoch )
+        {
+            for ( int t = 0; t < steps; ++t )
+            {
+                Step const & s = episode[t];
+
+                ForwardCache cache;
+                Forward( CurrentView(), s.x, s.canLeft, s.canRight, cache );
+
+                if ( epoch == 0 )
+                {
+                    REAL probability = cache.p[s.action];
+                    if ( probability < 1E-6f )
+                    {
+                        probability = 1E-6f;
+                    }
+                    policyLossTotal += -std::log( probability );
+
+                    REAL stepEntropy = 0;
+                    for ( int a = 0; a < kActions; ++a )
+                    {
+                        if ( cache.p[a] > 1E-6f )
+                        {
+                            stepEntropy += -cache.p[a] * std::log( cache.p[a] );
+                        }
+                    }
+                    entropyTotal += stepEntropy;
+                }
+
+                REAL scale = lr / static_cast< REAL >( steps * epochs );
+                Backward( cache, s.action, scale, 0 );
+            }
+        }
+
+        ApplyWeightDecay( lr );
+
+        ++episodes_;
+        ++updates_;
+        dirty_ = true;
+        MaybeWriteCheckpoint();
+        if ( sg_saveEvery < 1 ) sg_saveEvery = 1;
+        if ( episodes_ % static_cast< unsigned int >( sg_saveEvery ) == 0 ) Save();
+
+        stats.policyLoss = policyLossTotal / static_cast< REAL >( steps );
+        stats.valueLoss = 0;
+        stats.entropy = entropyTotal / static_cast< REAL >( steps );
+        stats.steps = static_cast< unsigned int >( steps );
+        stats.valid = true;
+        return stats;
     }
 
 private:
+    struct ForwardCache
+    {
+        REAL scalars[kTeacherScalarFeatures];
+        REAL mapIn[kTeacherMapChannels][kTeacherMapSize][kTeacherMapSize];
+        REAL conv1[kConv1Channels][kTeacherMapSize][kTeacherMapSize];
+        REAL conv2[kConv2Channels][kTeacherMapSize][kTeacherMapSize];
+        REAL denseIn[kDenseInput];
+        REAL h0[kHidden1];
+        REAL h1[kHidden2];
+        REAL p[kActions];
+        REAL v;
+    };
+
     struct WeightsView
     {
-        REAL const ( *w0 )[kFeatures];
-        REAL const * b0;
-        REAL const ( *w1 )[kTemporalHidden];
-        REAL const * b1;
-        REAL const ( *w2 )[kHidden1];
-        REAL const * b2;
-        REAL const ( *w3 )[kHidden2];
-        REAL const * b3;
-        REAL const ( *w4 )[kHidden3];
-        REAL const * b4;
-        REAL const * w5;
-        REAL b5;
+        REAL const ( *conv1 )[kTeacherMapChannels][kConvKernelSize][kConvKernelSize];
+        REAL const * bConv1;
+        REAL const ( *conv2 )[kConv1Channels][kConvKernelSize][kConvKernelSize];
+        REAL const * bConv2;
+        REAL const ( *dense0 )[kDenseInput];
+        REAL const * bDense0;
+        REAL const ( *dense1 )[kHidden1];
+        REAL const * bDense1;
+        REAL const ( *policy )[kHidden2];
+        REAL const * bPolicy;
+        REAL const * value;
+        REAL bValue;
     };
 
     struct Snapshot
     {
-        REAL w0[kTemporalHidden][kFeatures];
-        REAL b0[kTemporalHidden];
-        REAL w1[kHidden1][kTemporalHidden];
-        REAL b1[kHidden1];
-        REAL w2[kHidden2][kHidden1];
-        REAL b2[kHidden2];
-        REAL w3[kHidden3][kHidden2];
-        REAL b3[kHidden3];
-        REAL w4[kActions][kHidden3];
-        REAL b4[kActions];
-        REAL w5[kHidden3];
-        REAL b5;
+        REAL conv1[kConv1Channels][kTeacherMapChannels][kConvKernelSize][kConvKernelSize];
+        REAL bConv1[kConv1Channels];
+        REAL conv2[kConv2Channels][kConv1Channels][kConvKernelSize][kConvKernelSize];
+        REAL bConv2[kConv2Channels];
+        REAL dense0[kHidden1][kDenseInput];
+        REAL bDense0[kHidden1];
+        REAL dense1[kHidden2][kHidden1];
+        REAL bDense1[kHidden2];
+        REAL policy[kActions][kHidden2];
+        REAL bPolicy[kActions];
+        REAL value[kHidden2];
+        REAL bValue;
         unsigned int episode;
     };
 
-    Policy(): baseline_(0), episodes_(0), updates_(0), loaded_(false), dirty_(false)
+    Policy(): baseline_( 0 ), episodes_( 0 ), updates_( 0 ), loaded_( false ), dirty_( false )
     {
-        for ( int j = 0; j < kTemporalHidden; ++j )
+        ZeroWeights();
+    }
+
+    static REAL ActivationDerivative( REAL value )
+    {
+        return 1.0f - value * value;
+    }
+
+    void ZeroWeights()
+    {
+        for ( int oc = 0; oc < kConv1Channels; ++oc )
         {
-            b0_[j] = 0;
-            for ( int i = 0; i < kFeatures; ++i ) w0_[j][i] = 0;
+            bConv1_[oc] = 0;
+            for ( int ic = 0; ic < kTeacherMapChannels; ++ic )
+                for ( int ky = 0; ky < kConvKernelSize; ++ky )
+                    for ( int kx = 0; kx < kConvKernelSize; ++kx )
+                        conv1_[oc][ic][ky][kx] = 0;
         }
+
+        for ( int oc = 0; oc < kConv2Channels; ++oc )
+        {
+            bConv2_[oc] = 0;
+            for ( int ic = 0; ic < kConv1Channels; ++ic )
+                for ( int ky = 0; ky < kConvKernelSize; ++ky )
+                    for ( int kx = 0; kx < kConvKernelSize; ++kx )
+                        conv2_[oc][ic][ky][kx] = 0;
+        }
+
         for ( int j = 0; j < kHidden1; ++j )
         {
-            b1_[j] = 0;
-            for ( int i = 0; i < kTemporalHidden; ++i ) w1_[j][i] = 0;
+            bDense0_[j] = 0;
+            for ( int i = 0; i < kDenseInput; ++i ) dense0_[j][i] = 0;
         }
-        for ( int k = 0; k < kHidden2; ++k )
+        for ( int j = 0; j < kHidden2; ++j )
         {
-            b2_[k] = 0;
-            for ( int j = 0; j < kHidden1; ++j ) w2_[k][j] = 0;
-        }
-        for ( int k = 0; k < kHidden3; ++k )
-        {
-            b3_[k] = 0;
-            for ( int j = 0; j < kHidden2; ++j ) w3_[k][j] = 0;
+            bDense1_[j] = 0;
+            for ( int i = 0; i < kHidden1; ++i ) dense1_[j][i] = 0;
         }
         for ( int a = 0; a < kActions; ++a )
         {
-            b4_[a] = 0;
-            for ( int k = 0; k < kHidden3; ++k ) w4_[a][k] = 0;
+            bPolicy_[a] = 0;
+            for ( int i = 0; i < kHidden2; ++i ) policy_[a][i] = 0;
         }
-        b5_ = 0;
-        for ( int k = 0; k < kHidden3; ++k ) w5_[k] = 0;
+        for ( int i = 0; i < kHidden2; ++i ) value_[i] = 0;
+        bValue_ = 0;
     }
 
     WeightsView CurrentView() const
     {
         WeightsView view;
-        view.w0 = w0_;
-        view.b0 = b0_;
-        view.w1 = w1_;
-        view.b1 = b1_;
-        view.w2 = w2_;
-        view.b2 = b2_;
-        view.w3 = w3_;
-        view.b3 = b3_;
-        view.w4 = w4_;
-        view.b4 = b4_;
-        view.w5 = w5_;
-        view.b5 = b5_;
+        view.conv1 = conv1_;
+        view.bConv1 = bConv1_;
+        view.conv2 = conv2_;
+        view.bConv2 = bConv2_;
+        view.dense0 = dense0_;
+        view.bDense0 = bDense0_;
+        view.dense1 = dense1_;
+        view.bDense1 = bDense1_;
+        view.policy = policy_;
+        view.bPolicy = bPolicy_;
+        view.value = value_;
+        view.bValue = bValue_;
         return view;
     }
 
@@ -784,18 +1127,18 @@ private:
         {
             Snapshot const & snapshot = snapshots_[viewIndex];
             WeightsView view;
-            view.w0 = snapshot.w0;
-            view.b0 = snapshot.b0;
-            view.w1 = snapshot.w1;
-            view.b1 = snapshot.b1;
-            view.w2 = snapshot.w2;
-            view.b2 = snapshot.b2;
-            view.w3 = snapshot.w3;
-            view.b3 = snapshot.b3;
-            view.w4 = snapshot.w4;
-            view.b4 = snapshot.b4;
-            view.w5 = snapshot.w5;
-            view.b5 = snapshot.b5;
+            view.conv1 = snapshot.conv1;
+            view.bConv1 = snapshot.bConv1;
+            view.conv2 = snapshot.conv2;
+            view.bConv2 = snapshot.bConv2;
+            view.dense0 = snapshot.dense0;
+            view.bDense0 = snapshot.bDense0;
+            view.dense1 = snapshot.dense1;
+            view.bDense1 = snapshot.bDense1;
+            view.policy = snapshot.policy;
+            view.bPolicy = snapshot.bPolicy;
+            view.value = snapshot.value;
+            view.bValue = snapshot.bValue;
             return view;
         }
 
@@ -816,33 +1159,42 @@ private:
         snapshots_.push_back( Snapshot() );
         Snapshot & snapshot = snapshots_.back();
         snapshot.episode = episodes_;
-        for ( int j = 0; j < kTemporalHidden; ++j )
+
+        for ( int oc = 0; oc < kConv1Channels; ++oc )
         {
-            snapshot.b0[j] = b0_[j];
-            for ( int i = 0; i < kFeatures; ++i ) snapshot.w0[j][i] = w0_[j][i];
+            snapshot.bConv1[oc] = bConv1_[oc];
+            for ( int ic = 0; ic < kTeacherMapChannels; ++ic )
+                for ( int ky = 0; ky < kConvKernelSize; ++ky )
+                    for ( int kx = 0; kx < kConvKernelSize; ++kx )
+                        snapshot.conv1[oc][ic][ky][kx] = conv1_[oc][ic][ky][kx];
         }
+
+        for ( int oc = 0; oc < kConv2Channels; ++oc )
+        {
+            snapshot.bConv2[oc] = bConv2_[oc];
+            for ( int ic = 0; ic < kConv1Channels; ++ic )
+                for ( int ky = 0; ky < kConvKernelSize; ++ky )
+                    for ( int kx = 0; kx < kConvKernelSize; ++kx )
+                        snapshot.conv2[oc][ic][ky][kx] = conv2_[oc][ic][ky][kx];
+        }
+
         for ( int j = 0; j < kHidden1; ++j )
         {
-            snapshot.b1[j] = b1_[j];
-            for ( int i = 0; i < kTemporalHidden; ++i ) snapshot.w1[j][i] = w1_[j][i];
+            snapshot.bDense0[j] = bDense0_[j];
+            for ( int i = 0; i < kDenseInput; ++i ) snapshot.dense0[j][i] = dense0_[j][i];
         }
-        for ( int k = 0; k < kHidden2; ++k )
+        for ( int j = 0; j < kHidden2; ++j )
         {
-            snapshot.b2[k] = b2_[k];
-            for ( int j = 0; j < kHidden1; ++j ) snapshot.w2[k][j] = w2_[k][j];
-        }
-        for ( int k = 0; k < kHidden3; ++k )
-        {
-            snapshot.b3[k] = b3_[k];
-            for ( int j = 0; j < kHidden2; ++j ) snapshot.w3[k][j] = w3_[k][j];
+            snapshot.bDense1[j] = bDense1_[j];
+            for ( int i = 0; i < kHidden1; ++i ) snapshot.dense1[j][i] = dense1_[j][i];
         }
         for ( int a = 0; a < kActions; ++a )
         {
-            snapshot.b4[a] = b4_[a];
-            for ( int k = 0; k < kHidden3; ++k ) snapshot.w4[a][k] = w4_[a][k];
+            snapshot.bPolicy[a] = bPolicy_[a];
+            for ( int i = 0; i < kHidden2; ++i ) snapshot.policy[a][i] = policy_[a][i];
         }
-        snapshot.b5 = b5_;
-        for ( int k = 0; k < kHidden3; ++k ) snapshot.w5[k] = w5_[k];
+        snapshot.bValue = bValue_;
+        for ( int i = 0; i < kHidden2; ++i ) snapshot.value[i] = value_[i];
     }
 
     void MaybeWriteCheckpoint() const
@@ -875,41 +1227,91 @@ private:
         }
     }
 
-    void Forward( WeightsView const & view, REAL const x[kFeatures], bool canLeft, bool canRight, REAL h0[kTemporalHidden], REAL h1[kHidden1], REAL h2[kHidden2], REAL h3[kHidden3], REAL p[kActions], REAL & v ) const
+    void Forward( WeightsView const & view, REAL const x[kFeatures], bool canLeft, bool canRight, ForwardCache & cache ) const
     {
-        for ( int j = 0; j < kTemporalHidden; ++j )
+        UnpackTeacherInput( x, cache.scalars, cache.mapIn );
+
+        for ( int oc = 0; oc < kConv1Channels; ++oc )
         {
-            REAL sum = view.b0[j];
-            for ( int i = 0; i < kFeatures; ++i ) sum += view.w0[j][i] * x[i];
-            h0[j] = std::tanh( sum );
+            for ( int y = 0; y < kTeacherMapSize; ++y )
+            {
+                for ( int cellX = 0; cellX < kTeacherMapSize; ++cellX )
+                {
+                    REAL sum = view.bConv1[oc];
+                    for ( int ic = 0; ic < kTeacherMapChannels; ++ic )
+                    {
+                        for ( int ky = 0; ky < kConvKernelSize; ++ky )
+                        {
+                            int inputY = y + ky - 1;
+                            if ( inputY < 0 || inputY >= kTeacherMapSize ) continue;
+                            for ( int kx = 0; kx < kConvKernelSize; ++kx )
+                            {
+                                int inputX = cellX + kx - 1;
+                                if ( inputX < 0 || inputX >= kTeacherMapSize ) continue;
+                                sum += view.conv1[oc][ic][ky][kx] * cache.mapIn[ic][inputY][inputX];
+                            }
+                        }
+                    }
+                    cache.conv1[oc][y][cellX] = std::tanh( sum );
+                }
+            }
         }
+
+        for ( int oc = 0; oc < kConv2Channels; ++oc )
+        {
+            for ( int y = 0; y < kTeacherMapSize; ++y )
+            {
+                for ( int cellX = 0; cellX < kTeacherMapSize; ++cellX )
+                {
+                    REAL sum = view.bConv2[oc];
+                    for ( int ic = 0; ic < kConv1Channels; ++ic )
+                    {
+                        for ( int ky = 0; ky < kConvKernelSize; ++ky )
+                        {
+                            int inputY = y + ky - 1;
+                            if ( inputY < 0 || inputY >= kTeacherMapSize ) continue;
+                            for ( int kx = 0; kx < kConvKernelSize; ++kx )
+                            {
+                                int inputX = cellX + kx - 1;
+                                if ( inputX < 0 || inputX >= kTeacherMapSize ) continue;
+                                sum += view.conv2[oc][ic][ky][kx] * cache.conv1[ic][inputY][inputX];
+                            }
+                        }
+                    }
+                    cache.conv2[oc][y][cellX] = std::tanh( sum );
+                }
+            }
+        }
+
+        int denseIndex = 0;
+        for ( int i = 0; i < kTeacherScalarFeatures; ++i )
+        {
+            cache.denseIn[denseIndex++] = cache.scalars[i];
+        }
+        for ( int oc = 0; oc < kConv2Channels; ++oc )
+            for ( int y = 0; y < kTeacherMapSize; ++y )
+                for ( int cellX = 0; cellX < kTeacherMapSize; ++cellX )
+                    cache.denseIn[denseIndex++] = cache.conv2[oc][y][cellX];
 
         for ( int j = 0; j < kHidden1; ++j )
         {
-            REAL sum = view.b1[j];
-            for ( int i = 0; i < kTemporalHidden; ++i ) sum += view.w1[j][i] * h0[i];
-            h1[j] = std::tanh( sum );
+            REAL sum = view.bDense0[j];
+            for ( int i = 0; i < kDenseInput; ++i ) sum += view.dense0[j][i] * cache.denseIn[i];
+            cache.h0[j] = std::tanh( sum );
         }
 
-        for ( int k = 0; k < kHidden2; ++k )
+        for ( int j = 0; j < kHidden2; ++j )
         {
-            REAL sum = view.b2[k];
-            for ( int j = 0; j < kHidden1; ++j ) sum += view.w2[k][j] * h1[j];
-            h2[k] = std::tanh( sum );
-        }
-
-        for ( int k = 0; k < kHidden3; ++k )
-        {
-            REAL sum = view.b3[k];
-            for ( int j = 0; j < kHidden2; ++j ) sum += view.w3[k][j] * h2[j];
-            h3[k] = std::tanh( sum );
+            REAL sum = view.bDense1[j];
+            for ( int i = 0; i < kHidden1; ++i ) sum += view.dense1[j][i] * cache.h0[i];
+            cache.h1[j] = std::tanh( sum );
         }
 
         REAL logits[kActions];
         for ( int a = 0; a < kActions; ++a )
         {
-            REAL sum = view.b4[a];
-            for ( int k = 0; k < kHidden3; ++k ) sum += view.w4[a][k] * h3[k];
+            REAL sum = view.bPolicy[a];
+            for ( int i = 0; i < kHidden2; ++i ) sum += view.policy[a][i] * cache.h1[i];
             logits[a] = sum;
         }
         if ( !canLeft ) logits[0] = -1E+20f;
@@ -921,21 +1323,215 @@ private:
         REAL sumExp = 0;
         for ( int a = 0; a < kActions; ++a )
         {
-            p[a] = logits[a] < -1E+10f ? 0.0f : std::exp( logits[a] - maxLogit );
-            sumExp += p[a];
+            cache.p[a] = logits[a] < -1E+10f ? 0.0f : std::exp( logits[a] - maxLogit );
+            sumExp += cache.p[a];
         }
         if ( sumExp <= 0 )
         {
-            p[0] = canLeft ? 0.5f : 0.0f;
-            p[1] = 1.0f;
-            p[2] = canRight ? 0.5f : 0.0f;
-            sumExp = p[0] + p[1] + p[2];
+            cache.p[0] = canLeft ? 0.5f : 0.0f;
+            cache.p[1] = 1.0f;
+            cache.p[2] = canRight ? 0.5f : 0.0f;
+            sumExp = cache.p[0] + cache.p[1] + cache.p[2];
         }
-        for ( int a = 0; a < kActions; ++a ) p[a] /= sumExp;
+        for ( int a = 0; a < kActions; ++a ) cache.p[a] /= sumExp;
 
-        REAL value = view.b5;
-        for ( int k = 0; k < kHidden3; ++k ) value += view.w5[k] * h3[k];
-        v = value;
+        REAL value = view.bValue;
+        for ( int i = 0; i < kHidden2; ++i ) value += view.value[i] * cache.h1[i];
+        cache.v = value;
+    }
+
+    void Backward( ForwardCache const & cache, int action, REAL policyScale, REAL valueScale )
+    {
+        REAL dPolicy[kActions];
+        for ( int a = 0; a < kActions; ++a )
+        {
+            REAL target = ( a == action ) ? 1.0f : 0.0f;
+            dPolicy[a] = ( target - cache.p[a] ) * policyScale;
+        }
+
+        REAL dHidden1[kHidden2];
+        for ( int j = 0; j < kHidden2; ++j )
+        {
+            REAL back = valueScale * value_[j];
+            for ( int a = 0; a < kActions; ++a ) back += dPolicy[a] * policy_[a][j];
+            dHidden1[j] = ActivationDerivative( cache.h1[j] ) * back;
+        }
+
+        REAL dHidden0[kHidden1];
+        for ( int j = 0; j < kHidden1; ++j )
+        {
+            REAL back = 0;
+            for ( int k = 0; k < kHidden2; ++k ) back += dHidden1[k] * dense1_[k][j];
+            dHidden0[j] = ActivationDerivative( cache.h0[j] ) * back;
+        }
+
+        REAL dDenseIn[kDenseInput];
+        for ( int i = 0; i < kDenseInput; ++i )
+        {
+            REAL back = 0;
+            for ( int j = 0; j < kHidden1; ++j ) back += dHidden0[j] * dense0_[j][i];
+            dDenseIn[i] = back;
+        }
+
+        REAL dConv2[kConv2Channels][kTeacherMapSize][kTeacherMapSize];
+        for ( int oc = 0; oc < kConv2Channels; ++oc )
+            for ( int y = 0; y < kTeacherMapSize; ++y )
+                for ( int cellX = 0; cellX < kTeacherMapSize; ++cellX )
+                    dConv2[oc][y][cellX] = 0;
+
+        int denseIndex = kTeacherScalarFeatures;
+        for ( int oc = 0; oc < kConv2Channels; ++oc )
+            for ( int y = 0; y < kTeacherMapSize; ++y )
+                for ( int cellX = 0; cellX < kTeacherMapSize; ++cellX )
+                    dConv2[oc][y][cellX] = dDenseIn[denseIndex++];
+
+        REAL dConv2Raw[kConv2Channels][kTeacherMapSize][kTeacherMapSize];
+        for ( int oc = 0; oc < kConv2Channels; ++oc )
+            for ( int y = 0; y < kTeacherMapSize; ++y )
+                for ( int cellX = 0; cellX < kTeacherMapSize; ++cellX )
+                    dConv2Raw[oc][y][cellX] = ActivationDerivative( cache.conv2[oc][y][cellX] ) * dConv2[oc][y][cellX];
+
+        REAL dConv1[kConv1Channels][kTeacherMapSize][kTeacherMapSize];
+        for ( int oc = 0; oc < kConv1Channels; ++oc )
+            for ( int y = 0; y < kTeacherMapSize; ++y )
+                for ( int cellX = 0; cellX < kTeacherMapSize; ++cellX )
+                    dConv1[oc][y][cellX] = 0;
+
+        for ( int oc = 0; oc < kConv2Channels; ++oc )
+        {
+            for ( int y = 0; y < kTeacherMapSize; ++y )
+            {
+                for ( int cellX = 0; cellX < kTeacherMapSize; ++cellX )
+                {
+                    REAL grad = dConv2Raw[oc][y][cellX];
+                    for ( int ic = 0; ic < kConv1Channels; ++ic )
+                    {
+                        for ( int ky = 0; ky < kConvKernelSize; ++ky )
+                        {
+                            int inputY = y + ky - 1;
+                            if ( inputY < 0 || inputY >= kTeacherMapSize ) continue;
+                            for ( int kx = 0; kx < kConvKernelSize; ++kx )
+                            {
+                                int inputX = cellX + kx - 1;
+                                if ( inputX < 0 || inputX >= kTeacherMapSize ) continue;
+                                dConv1[ic][inputY][inputX] += grad * conv2_[oc][ic][ky][kx];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        REAL dConv1Raw[kConv1Channels][kTeacherMapSize][kTeacherMapSize];
+        for ( int oc = 0; oc < kConv1Channels; ++oc )
+            for ( int y = 0; y < kTeacherMapSize; ++y )
+                for ( int cellX = 0; cellX < kTeacherMapSize; ++cellX )
+                    dConv1Raw[oc][y][cellX] = ActivationDerivative( cache.conv1[oc][y][cellX] ) * dConv1[oc][y][cellX];
+
+        for ( int a = 0; a < kActions; ++a )
+        {
+            bPolicy_[a] += dPolicy[a];
+            for ( int i = 0; i < kHidden2; ++i ) policy_[a][i] += dPolicy[a] * cache.h1[i];
+        }
+
+        bValue_ += valueScale;
+        for ( int i = 0; i < kHidden2; ++i ) value_[i] += valueScale * cache.h1[i];
+
+        for ( int j = 0; j < kHidden2; ++j )
+        {
+            bDense1_[j] += dHidden1[j];
+            for ( int i = 0; i < kHidden1; ++i ) dense1_[j][i] += dHidden1[j] * cache.h0[i];
+        }
+
+        for ( int j = 0; j < kHidden1; ++j )
+        {
+            bDense0_[j] += dHidden0[j];
+            for ( int i = 0; i < kDenseInput; ++i ) dense0_[j][i] += dHidden0[j] * cache.denseIn[i];
+        }
+
+        for ( int oc = 0; oc < kConv2Channels; ++oc )
+        {
+            for ( int y = 0; y < kTeacherMapSize; ++y )
+            {
+                for ( int cellX = 0; cellX < kTeacherMapSize; ++cellX )
+                {
+                    REAL grad = dConv2Raw[oc][y][cellX];
+                    bConv2_[oc] += grad;
+                    for ( int ic = 0; ic < kConv1Channels; ++ic )
+                    {
+                        for ( int ky = 0; ky < kConvKernelSize; ++ky )
+                        {
+                            int inputY = y + ky - 1;
+                            if ( inputY < 0 || inputY >= kTeacherMapSize ) continue;
+                            for ( int kx = 0; kx < kConvKernelSize; ++kx )
+                            {
+                                int inputX = cellX + kx - 1;
+                                if ( inputX < 0 || inputX >= kTeacherMapSize ) continue;
+                                conv2_[oc][ic][ky][kx] += grad * cache.conv1[ic][inputY][inputX];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for ( int oc = 0; oc < kConv1Channels; ++oc )
+        {
+            for ( int y = 0; y < kTeacherMapSize; ++y )
+            {
+                for ( int cellX = 0; cellX < kTeacherMapSize; ++cellX )
+                {
+                    REAL grad = dConv1Raw[oc][y][cellX];
+                    bConv1_[oc] += grad;
+                    for ( int ic = 0; ic < kTeacherMapChannels; ++ic )
+                    {
+                        for ( int ky = 0; ky < kConvKernelSize; ++ky )
+                        {
+                            int inputY = y + ky - 1;
+                            if ( inputY < 0 || inputY >= kTeacherMapSize ) continue;
+                            for ( int kx = 0; kx < kConvKernelSize; ++kx )
+                            {
+                                int inputX = cellX + kx - 1;
+                                if ( inputX < 0 || inputX >= kTeacherMapSize ) continue;
+                                conv1_[oc][ic][ky][kx] += grad * cache.mapIn[ic][inputY][inputX];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    void ApplyWeightDecay( REAL lr )
+    {
+        REAL shrink = 1.0f - lr * Clamp( sg_weightDecay, 0.0f, 1.0f );
+
+        for ( int oc = 0; oc < kConv1Channels; ++oc )
+            for ( int ic = 0; ic < kTeacherMapChannels; ++ic )
+                for ( int ky = 0; ky < kConvKernelSize; ++ky )
+                    for ( int kx = 0; kx < kConvKernelSize; ++kx )
+                        conv1_[oc][ic][ky][kx] = Clamp( conv1_[oc][ic][ky][kx] * shrink, -sg_weightClip, sg_weightClip );
+
+        for ( int oc = 0; oc < kConv2Channels; ++oc )
+            for ( int ic = 0; ic < kConv1Channels; ++ic )
+                for ( int ky = 0; ky < kConvKernelSize; ++ky )
+                    for ( int kx = 0; kx < kConvKernelSize; ++kx )
+                        conv2_[oc][ic][ky][kx] = Clamp( conv2_[oc][ic][ky][kx] * shrink, -sg_weightClip, sg_weightClip );
+
+        for ( int j = 0; j < kHidden1; ++j )
+            for ( int i = 0; i < kDenseInput; ++i )
+                dense0_[j][i] = Clamp( dense0_[j][i] * shrink, -sg_weightClip, sg_weightClip );
+
+        for ( int j = 0; j < kHidden2; ++j )
+            for ( int i = 0; i < kHidden1; ++i )
+                dense1_[j][i] = Clamp( dense1_[j][i] * shrink, -sg_weightClip, sg_weightClip );
+
+        for ( int a = 0; a < kActions; ++a )
+            for ( int i = 0; i < kHidden2; ++i )
+                policy_[a][i] = Clamp( policy_[a][i] * shrink, -sg_weightClip, sg_weightClip );
+
+        for ( int i = 0; i < kHidden2; ++i )
+            value_[i] = Clamp( value_[i] * shrink, -sg_weightClip, sg_weightClip );
     }
 
     bool Load()
@@ -944,40 +1540,53 @@ private:
         if ( !tDirectories::Var().Open( in, static_cast< char const * >( sg_modelFile ) ) ) return false;
 
         std::string magic;
-        int f = 0, h0 = 0, h1 = 0, h2 = 0, h3 = 0, a = 0;
-        in >> magic >> f >> h0 >> h1 >> h2 >> h3 >> a;
-        if ( magic != "ARMAGETRON_TRAINED_AI_NN_V10" ||
-             f != kFeatures || h0 != kTemporalHidden || h1 != kHidden1 || h2 != kHidden2 || h3 != kHidden3 || a != kActions ) return false;
+        int scalarCount = 0, mapSize = 0, mapChannels = 0, conv1Channels = 0, conv2Channels = 0, h0 = 0, h1 = 0, actions = 0;
+        in >> magic >> scalarCount >> mapSize >> mapChannels >> conv1Channels >> conv2Channels >> h0 >> h1 >> actions;
+        if ( magic != "ARMAGETRON_TRAINED_AI_CNN_V1" ||
+             scalarCount != kTeacherScalarFeatures || mapSize != kTeacherMapSize || mapChannels != kTeacherMapChannels ||
+             conv1Channels != kConv1Channels || conv2Channels != kConv2Channels ||
+             h0 != kHidden1 || h1 != kHidden2 || actions != kActions )
+        {
+            return false;
+        }
         in >> baseline_ >> episodes_ >> updates_;
         if ( in.fail() ) return false;
 
-        for ( int j = 0; j < kTemporalHidden; ++j )
+        for ( int oc = 0; oc < kConv1Channels; ++oc )
         {
-            for ( int i = 0; i < kFeatures; ++i ) in >> w0_[j][i];
-            in >> b0_[j];
+            for ( int ic = 0; ic < kTeacherMapChannels; ++ic )
+                for ( int ky = 0; ky < kConvKernelSize; ++ky )
+                    for ( int kx = 0; kx < kConvKernelSize; ++kx )
+                        in >> conv1_[oc][ic][ky][kx];
+            in >> bConv1_[oc];
         }
+
+        for ( int oc = 0; oc < kConv2Channels; ++oc )
+        {
+            for ( int ic = 0; ic < kConv1Channels; ++ic )
+                for ( int ky = 0; ky < kConvKernelSize; ++ky )
+                    for ( int kx = 0; kx < kConvKernelSize; ++kx )
+                        in >> conv2_[oc][ic][ky][kx];
+            in >> bConv2_[oc];
+        }
+
         for ( int j = 0; j < kHidden1; ++j )
         {
-            for ( int i = 0; i < kTemporalHidden; ++i ) in >> w1_[j][i];
-            in >> b1_[j];
+            for ( int i = 0; i < kDenseInput; ++i ) in >> dense0_[j][i];
+            in >> bDense0_[j];
         }
-        for ( int k = 0; k < kHidden2; ++k )
+        for ( int j = 0; j < kHidden2; ++j )
         {
-            for ( int j = 0; j < kHidden1; ++j ) in >> w2_[k][j];
-            in >> b2_[k];
+            for ( int i = 0; i < kHidden1; ++i ) in >> dense1_[j][i];
+            in >> bDense1_[j];
         }
-        for ( int k = 0; k < kHidden3; ++k )
+        for ( int a = 0; a < kActions; ++a )
         {
-            for ( int j = 0; j < kHidden2; ++j ) in >> w3_[k][j];
-            in >> b3_[k];
+            for ( int i = 0; i < kHidden2; ++i ) in >> policy_[a][i];
+            in >> bPolicy_[a];
         }
-        for ( int ac = 0; ac < kActions; ++ac )
-        {
-            for ( int k = 0; k < kHidden3; ++k ) in >> w4_[ac][k];
-            in >> b4_[ac];
-        }
-        for ( int k = 0; k < kHidden3; ++k ) in >> w5_[k];
-        in >> b5_;
+        for ( int i = 0; i < kHidden2; ++i ) in >> value_[i];
+        in >> bValue_;
         return !in.fail();
     }
 
@@ -988,36 +1597,45 @@ private:
 
         out.setf( std::ios::fixed );
         out.precision( 9 );
-        out << "ARMAGETRON_TRAINED_AI_NN_V10\n";
-        out << kFeatures << " " << kTemporalHidden << " " << kHidden1 << " " << kHidden2 << " " << kHidden3 << " " << kActions << "\n";
+        out << "ARMAGETRON_TRAINED_AI_CNN_V1\n";
+        out << kTeacherScalarFeatures << " " << kTeacherMapSize << " " << kTeacherMapChannels << " "
+            << kConv1Channels << " " << kConv2Channels << " "
+            << kHidden1 << " " << kHidden2 << " " << kActions << "\n";
         out << baseline_ << " " << episodes_ << " " << updates_ << "\n";
-        for ( int j = 0; j < kTemporalHidden; ++j )
+
+        for ( int oc = 0; oc < kConv1Channels; ++oc )
         {
-            for ( int i = 0; i < kFeatures; ++i ) out << w0_[j][i] << " ";
-            out << b0_[j] << "\n";
+            for ( int ic = 0; ic < kTeacherMapChannels; ++ic )
+                for ( int ky = 0; ky < kConvKernelSize; ++ky )
+                    for ( int kx = 0; kx < kConvKernelSize; ++kx )
+                        out << conv1_[oc][ic][ky][kx] << " ";
+            out << bConv1_[oc] << "\n";
+        }
+        for ( int oc = 0; oc < kConv2Channels; ++oc )
+        {
+            for ( int ic = 0; ic < kConv1Channels; ++ic )
+                for ( int ky = 0; ky < kConvKernelSize; ++ky )
+                    for ( int kx = 0; kx < kConvKernelSize; ++kx )
+                        out << conv2_[oc][ic][ky][kx] << " ";
+            out << bConv2_[oc] << "\n";
         }
         for ( int j = 0; j < kHidden1; ++j )
         {
-            for ( int i = 0; i < kTemporalHidden; ++i ) out << w1_[j][i] << " ";
-            out << b1_[j] << "\n";
+            for ( int i = 0; i < kDenseInput; ++i ) out << dense0_[j][i] << " ";
+            out << bDense0_[j] << "\n";
         }
-        for ( int k = 0; k < kHidden2; ++k )
+        for ( int j = 0; j < kHidden2; ++j )
         {
-            for ( int j = 0; j < kHidden1; ++j ) out << w2_[k][j] << " ";
-            out << b2_[k] << "\n";
+            for ( int i = 0; i < kHidden1; ++i ) out << dense1_[j][i] << " ";
+            out << bDense1_[j] << "\n";
         }
-        for ( int k = 0; k < kHidden3; ++k )
+        for ( int a = 0; a < kActions; ++a )
         {
-            for ( int j = 0; j < kHidden2; ++j ) out << w3_[k][j] << " ";
-            out << b3_[k] << "\n";
+            for ( int i = 0; i < kHidden2; ++i ) out << policy_[a][i] << " ";
+            out << bPolicy_[a] << "\n";
         }
-        for ( int ac = 0; ac < kActions; ++ac )
-        {
-            for ( int k = 0; k < kHidden3; ++k ) out << w4_[ac][k] << " ";
-            out << b4_[ac] << "\n";
-        }
-        for ( int k = 0; k < kHidden3; ++k ) out << w5_[k] << " ";
-        out << b5_ << "\n";
+        for ( int i = 0; i < kHidden2; ++i ) out << value_[i] << " ";
+        out << bValue_ << "\n";
         return !out.fail();
     }
 
@@ -1032,109 +1650,54 @@ private:
 
     void Seed()
     {
-        for ( int j = 0; j < kTemporalHidden; ++j )
+        for ( int oc = 0; oc < kConv1Channels; ++oc )
         {
-            b0_[j] = RandomSigned() * 0.05f;
-            for ( int i = 0; i < kFeatures; ++i ) w0_[j][i] = RandomSigned() * 0.05f;
+            bConv1_[oc] = 0;
+            for ( int ic = 0; ic < kTeacherMapChannels; ++ic )
+                for ( int ky = 0; ky < kConvKernelSize; ++ky )
+                    for ( int kx = 0; kx < kConvKernelSize; ++kx )
+                        conv1_[oc][ic][ky][kx] = RandomSigned() * 0.05f;
+        }
+        for ( int oc = 0; oc < kConv2Channels; ++oc )
+        {
+            bConv2_[oc] = 0;
+            for ( int ic = 0; ic < kConv1Channels; ++ic )
+                for ( int ky = 0; ky < kConvKernelSize; ++ky )
+                    for ( int kx = 0; kx < kConvKernelSize; ++kx )
+                        conv2_[oc][ic][ky][kx] = RandomSigned() * 0.05f;
         }
         for ( int j = 0; j < kHidden1; ++j )
         {
-            b1_[j] = RandomSigned() * 0.05f;
-            for ( int i = 0; i < kTemporalHidden; ++i ) w1_[j][i] = RandomSigned() * 0.05f;
+            bDense0_[j] = RandomSigned() * 0.05f;
+            for ( int i = 0; i < kDenseInput; ++i ) dense0_[j][i] = RandomSigned() * 0.05f;
         }
-        for ( int k = 0; k < kHidden2; ++k )
+        for ( int j = 0; j < kHidden2; ++j )
         {
-            b2_[k] = RandomSigned() * 0.05f;
-            for ( int j = 0; j < kHidden1; ++j ) w2_[k][j] = RandomSigned() * 0.05f;
+            bDense1_[j] = RandomSigned() * 0.05f;
+            for ( int i = 0; i < kHidden1; ++i ) dense1_[j][i] = RandomSigned() * 0.05f;
         }
-        for ( int k = 0; k < kHidden3; ++k )
+        for ( int a = 0; a < kActions; ++a )
         {
-            b3_[k] = RandomSigned() * 0.05f;
-            for ( int j = 0; j < kHidden2; ++j ) w3_[k][j] = RandomSigned() * 0.05f;
+            bPolicy_[a] = 0;
+            for ( int i = 0; i < kHidden2; ++i ) policy_[a][i] = RandomSigned() * 0.05f;
         }
-        for ( int ac = 0; ac < kActions; ++ac )
-        {
-            b4_[ac] = 0;
-            for ( int k = 0; k < kHidden3; ++k ) w4_[ac][k] = RandomSigned() * 0.05f;
-        }
-        b5_ = 0;
-        for ( int k = 0; k < kHidden3; ++k ) w5_[k] = RandomSigned() * 0.05f;
-
-        for ( int i = 0; i < kBaseFeatures && i < kTemporalHidden; ++i )
-        {
-            for ( int k = 0; k < kFeatures; ++k ) w0_[i][k] = 0;
-            w0_[i][kCurrentFrameOffset + i] = 1.5f;
-            b0_[i] = 0;
-        }
-
-        for ( int i = 0; i < kBaseFeatures && i < kHidden1; ++i )
-        {
-            for ( int j = 0; j < kTemporalHidden; ++j ) w1_[i][j] = 0;
-            w1_[i][i] = 1.0f;
-            b1_[i] = 0;
-        }
-
-        for ( int i = 0; i < kBaseFeatures && i < kHidden2; ++i )
-        {
-            for ( int j = 0; j < kHidden1; ++j ) w2_[i][j] = 0;
-            w2_[i][i] = 1.0f;
-            b2_[i] = 0;
-        }
-
-        for ( int i = 0; i < kBaseFeatures && i < kHidden3; ++i )
-        {
-            for ( int j = 0; j < kHidden2; ++j ) w3_[i][j] = 0;
-            w3_[i][i] = 1.0f;
-            b3_[i] = 0;
-        }
-
-        w4_[1][kFront] += 1.8f;
-        w4_[1][kFrontNarrowLeft] += 1.0f;
-        w4_[1][kFrontNarrowRight] += 1.0f;
-        w4_[1][kFrontLeft] += 0.6f;
-        w4_[1][kFrontRight] += 0.6f;
-        w4_[1][kFrontPressure] += -1.2f;
-        w4_[1][kFrontRimWall] += -1.0f;
-
-        w4_[0][kLeft] += 1.8f;
-        w4_[0][kFrontLeft] += 1.3f;
-        w4_[0][kWideLeft] += 1.0f;
-        w4_[0][kBackLeft] += 0.8f;
-        w4_[0][kEscapeLeft] += 1.2f;
-        w4_[0][kFront] += -1.2f;
-        w4_[0][kCanLeft] += 1.0f;
-        w4_[0][kLeftRimWall] += -0.8f;
-
-        w4_[2][kRight] += 1.8f;
-        w4_[2][kFrontRight] += 1.3f;
-        w4_[2][kWideRight] += 1.0f;
-        w4_[2][kBackRight] += 0.8f;
-        w4_[2][kEscapeRight] += 1.2f;
-        w4_[2][kFront] += -1.2f;
-        w4_[2][kCanRight] += 1.0f;
-        w4_[2][kRightRimWall] += -0.8f;
-
-        w5_[kFront] += 1.0f;
-        w5_[kForwardArcSafety] += 0.8f;
-        w5_[kWallCrowding] += -1.0f;
-        w5_[kEnemyNear] += -0.6f;
-        w5_[kEnemyFrontProximity] += -0.5f;
-        w5_[kEscapeLeft] += 0.4f;
-        w5_[kEscapeRight] += 0.4f;
+        bValue_ = 0;
+        for ( int i = 0; i < kHidden2; ++i ) value_[i] = RandomSigned() * 0.05f;
+        bPolicy_[1] = 0.2f;
     }
 
-    REAL w0_[kTemporalHidden][kFeatures];
-    REAL b0_[kTemporalHidden];
-    REAL w1_[kHidden1][kTemporalHidden];
-    REAL b1_[kHidden1];
-    REAL w2_[kHidden2][kHidden1];
-    REAL b2_[kHidden2];
-    REAL w3_[kHidden3][kHidden2];
-    REAL b3_[kHidden3];
-    REAL w4_[kActions][kHidden3];
-    REAL b4_[kActions];
-    REAL w5_[kHidden3];
-    REAL b5_;
+    REAL conv1_[kConv1Channels][kTeacherMapChannels][kConvKernelSize][kConvKernelSize];
+    REAL bConv1_[kConv1Channels];
+    REAL conv2_[kConv2Channels][kConv1Channels][kConvKernelSize][kConvKernelSize];
+    REAL bConv2_[kConv2Channels];
+    REAL dense0_[kHidden1][kDenseInput];
+    REAL bDense0_[kHidden1];
+    REAL dense1_[kHidden2][kHidden1];
+    REAL bDense1_[kHidden2];
+    REAL policy_[kActions][kHidden2];
+    REAL bPolicy_[kActions];
+    REAL value_[kHidden2];
+    REAL bValue_;
     REAL baseline_;
     unsigned int episodes_;
     unsigned int updates_;
@@ -1146,12 +1709,14 @@ private:
 struct OfflineEpisodeData
 {
     OfflineEpisodeData()
-        : survived( false ),
+        : teacher( false ),
+          survived( false ),
           distance( 0 ),
           reward( 0 )
     {
     }
 
+    bool teacher;
     bool survived;
     REAL distance;
     REAL reward;
@@ -1164,16 +1729,23 @@ public:
     OfflineTrainerState()
         : metricsEpisodes_( 0 ),
           wins_( 0 ),
+          learnedEpisodes_( 0 ),
           rewardTotal_( 0 ),
           distanceTotal_( 0 ),
           predictedValueTotal_( 0 ),
           stepsTotal_( 0 ),
+          policyLossTotal_( 0 ),
+          valueLossTotal_( 0 ),
+          entropyTotal_( 0 ),
           lastSurvived_( false ),
           lastReward_( 0 ),
           lastDistance_( 0 ),
           lastAveragePredictedValue_( 0 ),
           lastSteps_( 0 ),
-          lastLearned_( false )
+          lastLearned_( false ),
+          lastPolicyLoss_( 0 ),
+          lastValueLoss_( 0 ),
+          lastEntropy_( 0 )
     {
     }
 
@@ -1209,7 +1781,7 @@ public:
         sourceEpisodes_[path] += episodes;
     }
 
-    void RecordEpisode( bool survived, REAL distance, REAL reward, REAL averagePredictedValue, unsigned int steps, bool learned )
+    void RecordEpisode( bool survived, REAL distance, REAL reward, REAL averagePredictedValue, unsigned int steps, LearningStats const & learningStats, bool learned )
     {
         ++metricsEpisodes_;
         if ( survived )
@@ -1220,6 +1792,16 @@ public:
         distanceTotal_ += distance;
         predictedValueTotal_ += averagePredictedValue;
         stepsTotal_ += steps;
+        if ( learningStats.valid )
+        {
+            ++learnedEpisodes_;
+            policyLossTotal_ += learningStats.policyLoss;
+            valueLossTotal_ += learningStats.valueLoss;
+            entropyTotal_ += learningStats.entropy;
+            lastPolicyLoss_ = learningStats.policyLoss;
+            lastValueLoss_ = learningStats.valueLoss;
+            lastEntropy_ = learningStats.entropy;
+        }
         lastSurvived_ = survived;
         lastReward_ = reward;
         lastDistance_ = distance;
@@ -1230,6 +1812,7 @@ public:
 
     unsigned long long MetricsEpisodes() const { return metricsEpisodes_; }
     unsigned long long Wins() const { return wins_; }
+    unsigned long long LearnedEpisodes() const { return learnedEpisodes_; }
     REAL RewardTotal() const { return rewardTotal_; }
     REAL DistanceTotal() const { return distanceTotal_; }
     REAL PredictedValueTotal() const { return predictedValueTotal_; }
@@ -1240,6 +1823,9 @@ public:
     REAL LastAveragePredictedValue() const { return lastAveragePredictedValue_; }
     unsigned int LastSteps() const { return lastSteps_; }
     bool LastLearned() const { return lastLearned_; }
+    REAL LastPolicyLoss() const { return lastPolicyLoss_; }
+    REAL LastValueLoss() const { return lastValueLoss_; }
+    REAL LastEntropy() const { return lastEntropy_; }
 
     REAL WinRate() const
     {
@@ -1286,6 +1872,36 @@ public:
         return static_cast< REAL >( stepsTotal_ ) / static_cast< REAL >( metricsEpisodes_ );
     }
 
+    REAL AveragePolicyLoss() const
+    {
+        if ( learnedEpisodes_ <= 0 )
+        {
+            return 0;
+        }
+
+        return policyLossTotal_ / static_cast< REAL >( learnedEpisodes_ );
+    }
+
+    REAL AverageValueLoss() const
+    {
+        if ( learnedEpisodes_ <= 0 )
+        {
+            return 0;
+        }
+
+        return valueLossTotal_ / static_cast< REAL >( learnedEpisodes_ );
+    }
+
+    REAL AverageEntropy() const
+    {
+        if ( learnedEpisodes_ <= 0 )
+        {
+            return 0;
+        }
+
+        return entropyTotal_ / static_cast< REAL >( learnedEpisodes_ );
+    }
+
     bool Load()
     {
         char const * stateFile = static_cast< char const * >( sg_offlineStateFile );
@@ -1318,6 +1934,10 @@ public:
             {
                 in >> wins_;
             }
+            else if ( key == "learned_episodes" )
+            {
+                in >> learnedEpisodes_;
+            }
             else if ( key == "reward_total" )
             {
                 in >> rewardTotal_;
@@ -1333,6 +1953,18 @@ public:
             else if ( key == "steps_total" )
             {
                 in >> stepsTotal_;
+            }
+            else if ( key == "policy_loss_total" )
+            {
+                in >> policyLossTotal_;
+            }
+            else if ( key == "value_loss_total" )
+            {
+                in >> valueLossTotal_;
+            }
+            else if ( key == "entropy_total" )
+            {
+                in >> entropyTotal_;
             }
             else if ( key == "last_survived" )
             {
@@ -1355,6 +1987,18 @@ public:
             else if ( key == "last_steps" )
             {
                 in >> lastSteps_;
+            }
+            else if ( key == "last_policy_loss" )
+            {
+                in >> lastPolicyLoss_;
+            }
+            else if ( key == "last_value_loss" )
+            {
+                in >> lastValueLoss_;
+            }
+            else if ( key == "last_entropy" )
+            {
+                in >> lastEntropy_;
             }
             else if ( key == "last_learned" )
             {
@@ -1400,15 +2044,22 @@ public:
         out << "BLACKLIGHT_OFFLINE_TRAIN_STATE_V1\n";
         out << "metrics_episodes " << metricsEpisodes_ << "\n";
         out << "wins " << wins_ << "\n";
+        out << "learned_episodes " << learnedEpisodes_ << "\n";
         out << "reward_total " << rewardTotal_ << "\n";
         out << "distance_total " << distanceTotal_ << "\n";
         out << "predicted_value_total " << predictedValueTotal_ << "\n";
         out << "steps_total " << stepsTotal_ << "\n";
+        out << "policy_loss_total " << policyLossTotal_ << "\n";
+        out << "value_loss_total " << valueLossTotal_ << "\n";
+        out << "entropy_total " << entropyTotal_ << "\n";
         out << "last_survived " << ( lastSurvived_ ? 1 : 0 ) << "\n";
         out << "last_reward " << lastReward_ << "\n";
         out << "last_distance " << lastDistance_ << "\n";
         out << "last_average_predicted_value " << lastAveragePredictedValue_ << "\n";
         out << "last_steps " << lastSteps_ << "\n";
+        out << "last_policy_loss " << lastPolicyLoss_ << "\n";
+        out << "last_value_loss " << lastValueLoss_ << "\n";
+        out << "last_entropy " << lastEntropy_ << "\n";
         out << "last_learned " << ( lastLearned_ ? 1 : 0 ) << "\n";
 
         for ( std::map< std::string, long long >::const_iterator it = offsets_.begin(); it != offsets_.end(); ++it )
@@ -1424,16 +2075,23 @@ public:
 private:
     unsigned long long metricsEpisodes_;
     unsigned long long wins_;
+    unsigned long long learnedEpisodes_;
     REAL rewardTotal_;
     REAL distanceTotal_;
     REAL predictedValueTotal_;
     unsigned long long stepsTotal_;
+    REAL policyLossTotal_;
+    REAL valueLossTotal_;
+    REAL entropyTotal_;
     bool lastSurvived_;
     REAL lastReward_;
     REAL lastDistance_;
     REAL lastAveragePredictedValue_;
     unsigned int lastSteps_;
     bool lastLearned_;
+    REAL lastPolicyLoss_;
+    REAL lastValueLoss_;
+    REAL lastEntropy_;
     std::map< std::string, long long > offsets_;
     std::map< std::string, unsigned long long > sourceEpisodes_;
 };
@@ -1455,7 +2113,7 @@ static bool OfflineMetricsNeedsHeader()
     return in.peek() == std::ifstream::traits_type::eof();
 }
 
-static void AppendOfflineMetricsCsv( OfflineTrainerState const & state, bool survived, REAL distance, REAL reward, REAL averagePredictedValue, unsigned int steps, bool learned, unsigned int policyEpisodes, unsigned int policyUpdates )
+static void AppendOfflineMetricsCsv( OfflineTrainerState const & state, bool survived, REAL distance, REAL reward, REAL averagePredictedValue, unsigned int steps, LearningStats const & learningStats, bool learned, unsigned int policyEpisodes, unsigned int policyUpdates )
 {
     char const * metricsFile = static_cast< char const * >( sg_metricsFile );
     if ( !metricsFile || !metricsFile[0] )
@@ -1476,7 +2134,7 @@ static void AppendOfflineMetricsCsv( OfflineTrainerState const & state, bool sur
 
     if ( writeHeader )
     {
-        out << "episode,survived,reward,distance,average_predicted_value,steps,learned,policy_episodes,policy_updates,cumulative_win_rate,cumulative_average_reward,cumulative_average_distance,cumulative_average_predicted_value\n";
+        out << "episode,survived,reward,distance,average_predicted_value,steps,learned,policy_episodes,policy_updates,cumulative_win_rate,cumulative_average_reward,cumulative_average_distance,cumulative_average_predicted_value,policy_loss,value_loss,entropy,cumulative_average_policy_loss,cumulative_average_value_loss,cumulative_average_entropy\n";
     }
 
     out << state.MetricsEpisodes()
@@ -1492,6 +2150,12 @@ static void AppendOfflineMetricsCsv( OfflineTrainerState const & state, bool sur
         << "," << state.AverageReward()
         << "," << state.AverageDistance()
         << "," << state.AveragePredictedValue()
+        << "," << ( learningStats.valid ? learningStats.policyLoss : 0 )
+        << "," << ( learningStats.valid ? learningStats.valueLoss : 0 )
+        << "," << ( learningStats.valid ? learningStats.entropy : 0 )
+        << "," << state.AveragePolicyLoss()
+        << "," << state.AverageValueLoss()
+        << "," << state.AverageEntropy()
         << "\n";
 }
 
@@ -1521,11 +2185,19 @@ static void WriteOfflineMetricsSummary( OfflineTrainerState const & state, unsig
     out << "average_distance " << state.AverageDistance() << "\n";
     out << "average_predicted_value " << state.AveragePredictedValue() << "\n";
     out << "average_steps " << state.AverageSteps() << "\n";
+    out << "steps_total " << state.StepsTotal() << "\n";
+    out << "learned_episodes " << state.LearnedEpisodes() << "\n";
+    out << "average_policy_loss " << state.AveragePolicyLoss() << "\n";
+    out << "average_value_loss " << state.AverageValueLoss() << "\n";
+    out << "average_entropy " << state.AverageEntropy() << "\n";
     out << "last_survived " << ( state.LastSurvived() ? 1 : 0 ) << "\n";
     out << "last_reward " << state.LastReward() << "\n";
     out << "last_distance " << state.LastDistance() << "\n";
     out << "last_average_predicted_value " << state.LastAveragePredictedValue() << "\n";
     out << "last_steps " << state.LastSteps() << "\n";
+    out << "last_policy_loss " << state.LastPolicyLoss() << "\n";
+    out << "last_value_loss " << state.LastValueLoss() << "\n";
+    out << "last_entropy " << state.LastEntropy() << "\n";
     out << "last_learned " << ( state.LastLearned() ? 1 : 0 ) << "\n";
     out << "policy_episodes " << policyEpisodes << "\n";
     out << "policy_updates " << policyUpdates << "\n";
@@ -1610,6 +2282,54 @@ static bool ParseOfflineRecordedStep( std::string const & line, unsigned long lo
     return true;
 }
 
+static bool ParseTeacherRecordedStep( std::string const & line, unsigned long long & episodeId, Step & step )
+{
+    std::istringstream in( line );
+    std::string tag;
+    unsigned int stepIndex = 0;
+    int action = 1;
+    int canLeft = 0;
+    int canRight = 0;
+    REAL halfExtent = 0;
+
+    if ( !( in >> tag >> episodeId >> stepIndex >> action >> canLeft >> canRight >> halfExtent ) )
+    {
+        return false;
+    }
+    if ( tag != "teacher_v1" )
+    {
+        return false;
+    }
+
+    step.action = action;
+    step.canLeft = canLeft != 0;
+    step.canRight = canRight != 0;
+    step.v = 0;
+    for ( int a = 0; a < kActions; ++a )
+    {
+        step.p[a] = 0;
+    }
+
+    int index = 0;
+    for ( int i = 0; i < kTeacherScalarFeatures; ++i )
+    {
+        if ( !( in >> step.x[index++] ) )
+        {
+            return false;
+        }
+    }
+
+    for ( int channel = 0; channel < kTeacherMapChannels; ++channel )
+        for ( int y = 0; y < kTeacherMapSize; ++y )
+            for ( int cellX = 0; cellX < kTeacherMapSize; ++cellX )
+                if ( !( in >> step.x[index++] ) )
+                {
+                    return false;
+                }
+
+    return index == kFeatures;
+}
+
 static long long VarFileSize( std::string const & path )
 {
     std::ifstream in;
@@ -1635,14 +2355,17 @@ static void TrainOfflineEpisode( OfflineEpisodeData const & episodeData, Offline
         return;
     }
 
-    REAL averagePredictedValue = AveragePredictedValue( episodeData.steps );
-    Policy::Get().Train( episodeData.steps, episodeData.reward );
+    REAL averagePredictedValue = episodeData.teacher ? 0 : AveragePredictedValue( episodeData.steps );
+    LearningStats learningStats = episodeData.teacher
+        ? Policy::Get().TrainTeacher( episodeData.steps )
+        : Policy::Get().Train( episodeData.steps, episodeData.reward );
     state.RecordEpisode(
         episodeData.survived,
         episodeData.distance,
         episodeData.reward,
         averagePredictedValue,
         static_cast< unsigned int >( episodeData.steps.size() ),
+        learningStats,
         true );
     AppendOfflineMetricsCsv(
         state,
@@ -1651,6 +2374,7 @@ static void TrainOfflineEpisode( OfflineEpisodeData const & episodeData, Offline
         episodeData.reward,
         averagePredictedValue,
         static_cast< unsigned int >( episodeData.steps.size() ),
+        learningStats,
         true,
         Policy::Get().Episodes(),
         Policy::Get().Updates() );
@@ -1691,7 +2415,16 @@ static unsigned int TrainOfflineSource( std::string const & path, OfflineTrainer
         REAL distance = 0;
         REAL reward = 0;
         unsigned long long episodeId = 0;
-        if ( !ParseOfflineRecordedStep( line, episodeId, survived, distance, reward, step ) )
+        bool isTeacher = false;
+        if ( line.compare( 0, 10, "teacher_v1" ) == 0 )
+        {
+            isTeacher = true;
+            if ( !ParseTeacherRecordedStep( line, episodeId, step ) )
+            {
+                continue;
+            }
+        }
+        else if ( !ParseOfflineRecordedStep( line, episodeId, survived, distance, reward, step ) )
         {
             continue;
         }
@@ -1700,16 +2433,18 @@ static unsigned int TrainOfflineSource( std::string const & path, OfflineTrainer
         {
             hasEpisode = true;
             currentEpisodeId = episodeId;
+            currentEpisode.teacher = isTeacher;
             currentEpisode.survived = survived;
             currentEpisode.distance = distance;
             currentEpisode.reward = reward;
             currentEpisode.steps.clear();
         }
-        else if ( episodeId != currentEpisodeId )
+        else if ( episodeId != currentEpisodeId || currentEpisode.teacher != isTeacher )
         {
             TrainOfflineEpisode( currentEpisode, state );
             ++trainedEpisodes;
             currentEpisodeId = episodeId;
+            currentEpisode.teacher = isTeacher;
             currentEpisode.survived = survived;
             currentEpisode.distance = distance;
             currentEpisode.reward = reward;
@@ -1811,14 +2546,9 @@ class gTrainedAI : public gSimpleAI
 public:
     gTrainedAI()
         : policyView_( Policy::Get().AcquireView() ),
-          trainThisEpisode_( Policy::Get().IsLiveView( policyView_ ) ),
-          hasEnemyHistory_( false ),
-          prevEnemyDistance_( 0 ),
-          prevEnemySide_( 0 ),
-          historyReady_( false )
+          trainThisEpisode_( Policy::Get().IsLiveView( policyView_ ) )
     {
         episode_.reserve( 512 );
-        ResetTemporalState();
     }
 
     virtual void OnRoundResult( bool survived, REAL distance ) override
@@ -1828,9 +2558,10 @@ public:
         REAL averagePredictedValue = AveragePredictedValue( episode_ );
         RecordEpisode( episode_, survived, distance, reward );
         bool learned = false;
+        LearningStats learningStats;
         if ( sg_learn && trainThisEpisode_ )
         {
-            Policy::Get().Train( episode_, reward );
+            learningStats = Policy::Get().Train( episode_, reward );
             learned = true;
         }
         TrainingMetrics::Get().RecordEpisode(
@@ -1839,13 +2570,13 @@ public:
             reward,
             averagePredictedValue,
             static_cast< unsigned int >( episode_.size() ),
+            learningStats,
             learned,
             Policy::Get().Episodes(),
             Policy::Get().Updates() );
         episode_.clear();
         policyView_ = Policy::Get().AcquireView();
         trainThisEpisode_ = Policy::Get().IsLiveView( policyView_ );
-        ResetTemporalState();
     }
 
 protected:
@@ -1854,120 +2585,16 @@ protected:
         gCycle * cycle = Object();
         if ( !cycle || !cycle->Alive() ) return sg_thinkTime;
 
-        REAL speed = cycle->Speed();
-        if ( speed < .1f ) speed = .1f;
-        REAL lookAhead = speed * Clamp( sg_lookAheadSeconds, .2f, 20.0f );
-        if ( lookAhead < 8.0f ) lookAhead = 8.0f;
-        bool canLeft = cycle->CanMakeTurn( -1 );
-        bool canRight = cycle->CanMakeTurn( 1 );
-
-        eCoord dir = cycle->Direction();
-        gSensorWallType frontWallType = gSENSOR_NONE;
-        gSensorWallType leftWallType = gSENSOR_NONE;
-        gSensorWallType rightWallType = gSENSOR_NONE;
-        REAL frontDistance = SenseDistance( cycle, dir, lookAhead, &frontWallType );
-        REAL frontNarrowLeftDistance = SenseDistance( cycle, dir.Turn( .923879533f, .382683432f ), lookAhead );
-        REAL frontNarrowRightDistance = SenseDistance( cycle, dir.Turn( .923879533f, -.382683432f ), lookAhead );
-        REAL frontLeftDistance = SenseDistance( cycle, dir.Turn( .70710678f, .70710678f ), lookAhead );
-        REAL frontRightDistance = SenseDistance( cycle, dir.Turn( .70710678f, -.70710678f ), lookAhead );
-        REAL wideLeftDistance = SenseDistance( cycle, dir.Turn( .382683432f, .923879533f ), lookAhead );
-        REAL wideRightDistance = SenseDistance( cycle, dir.Turn( .382683432f, -.923879533f ), lookAhead );
-        REAL leftDistance = SenseDistance( cycle, dir.Turn( 0, 1 ), lookAhead, &leftWallType );
-        REAL rightDistance = SenseDistance( cycle, dir.Turn( 0, -1 ), lookAhead, &rightWallType );
-        REAL backLeftDistance = SenseDistance( cycle, dir.Turn( -.70710678f, .70710678f ), lookAhead );
-        REAL backRightDistance = SenseDistance( cycle, dir.Turn( -.70710678f, -.70710678f ), lookAhead );
-        REAL backDistance = SenseDistance( cycle, dir.Turn( -1, 0 ), lookAhead );
-
-        REAL frame[kBaseFeatures] = { 0 };
-        frame[kBias] = 1.0f;
-        frame[kFront] = Clamp( frontDistance / lookAhead, 0.0f, 1.0f );
-        frame[kFrontNarrowLeft] = Clamp( frontNarrowLeftDistance / lookAhead, 0.0f, 1.0f );
-        frame[kFrontNarrowRight] = Clamp( frontNarrowRightDistance / lookAhead, 0.0f, 1.0f );
-        frame[kFrontLeft] = Clamp( frontLeftDistance / lookAhead, 0.0f, 1.0f );
-        frame[kFrontRight] = Clamp( frontRightDistance / lookAhead, 0.0f, 1.0f );
-        frame[kWideLeft] = Clamp( wideLeftDistance / lookAhead, 0.0f, 1.0f );
-        frame[kWideRight] = Clamp( wideRightDistance / lookAhead, 0.0f, 1.0f );
-        frame[kLeft] = Clamp( leftDistance / lookAhead, 0.0f, 1.0f );
-        frame[kRight] = Clamp( rightDistance / lookAhead, 0.0f, 1.0f );
-        frame[kBackLeft] = Clamp( backLeftDistance / lookAhead, 0.0f, 1.0f );
-        frame[kBackRight] = Clamp( backRightDistance / lookAhead, 0.0f, 1.0f );
-        frame[kBack] = Clamp( backDistance / lookAhead, 0.0f, 1.0f );
-        frame[kSpeed] = speed / ( speed + 20.0f );
-        frame[kCanLeft] = canLeft ? 1.0f : 0.0f;
-        frame[kCanRight] = canRight ? 1.0f : 0.0f;
-        frame[kTurnDelay] = Clamp( cycle->GetTurnDelay() / ( sg_lookAheadSeconds + .1f ), 0.0f, 1.0f );
-
-        eCoord enemyPos;
-        REAL enemySpeed = 0;
-        eCoord enemyHeading;
-        if ( FindClosestEnemy( cycle, enemyPos, enemySpeed, enemyHeading ) )
-        {
-            REAL dist = std::sqrt( enemyPos.NormSquared() );
-            REAL denom = dist + 1.0f;
-            frame[kEnemyAhead] = Clamp( enemyPos.y / denom, -1.0f, 1.0f );
-            frame[kEnemySide] = Clamp( enemyPos.x / denom, -1.0f, 1.0f );
-            frame[kEnemyNear] = 1.0f - Clamp( dist / ( lookAhead * 2.0f ), 0.0f, 1.0f );
-            frame[kEnemySpeedDiff] = ( enemySpeed - speed ) / ( std::fabs( enemySpeed ) + std::fabs( speed ) + 1.0f );
-            frame[kEnemyHeadingDot] = Clamp( enemyHeading.y, -1.0f, 1.0f );
-            frame[kEnemyCrossing] = Clamp( enemyHeading.x, -1.0f, 1.0f );
-            frame[kEnemyFrontProximity] = frame[kEnemyNear] * Clamp( frame[kEnemyAhead], 0.0f, 1.0f );
-
-            if ( hasEnemyHistory_ )
-            {
-                REAL denomDistance = lookAhead + 1.0f;
-                frame[kEnemyClosing] = Clamp( ( prevEnemyDistance_ - dist ) / denomDistance, -1.0f, 1.0f );
-                frame[kEnemyLateralClosing] = Clamp( ( enemyPos.x - prevEnemySide_ ) / denomDistance, -1.0f, 1.0f );
-                REAL prevSideNormalized = Clamp( prevEnemySide_ / ( prevEnemyDistance_ + 1.0f ), -1.0f, 1.0f );
-                frame[kEnemyBearingDrift] = Clamp( frame[kEnemySide] - prevSideNormalized, -1.0f, 1.0f );
-            }
-            prevEnemyDistance_ = dist;
-            prevEnemySide_ = enemyPos.x;
-            hasEnemyHistory_ = true;
-        }
-        else
-        {
-            hasEnemyHistory_ = false;
-        }
-        frame[kFrontEnemyWall] = frontWallType == gSENSOR_ENEMY ? 1.0f : 0.0f;
-        frame[kFrontRimWall] = frontWallType == gSENSOR_RIM ? 1.0f : 0.0f;
-        frame[kLeftEnemyWall] = leftWallType == gSENSOR_ENEMY ? 1.0f : 0.0f;
-        frame[kRightEnemyWall] = rightWallType == gSENSOR_ENEMY ? 1.0f : 0.0f;
-        frame[kLeftRimWall] = leftWallType == gSENSOR_RIM ? 1.0f : 0.0f;
-        frame[kRightRimWall] = rightWallType == gSENSOR_RIM ? 1.0f : 0.0f;
-        frame[kLeftRightBalance] = Clamp( frame[kLeft] - frame[kRight], -1.0f, 1.0f );
-        frame[kFrontPressure] = 1.0f - frame[kFront];
-        frame[kBackPressure] = 1.0f - frame[kBack];
-        frame[kWallCrowding] = 1.0f - Clamp(
-            ( frame[kFront] + frame[kFrontNarrowLeft] + frame[kFrontNarrowRight] + frame[kLeft] + frame[kRight] + frame[kBack] ) / 6.0f,
-            0.0f,
-            1.0f );
-        frame[kForwardArcSafety] = Clamp(
-            ( frame[kFront] + frame[kFrontNarrowLeft] + frame[kFrontNarrowRight] + frame[kFrontLeft] + frame[kFrontRight] + frame[kWideLeft] + frame[kWideRight] ) / 7.0f,
-            0.0f,
-            1.0f );
-        frame[kSideArcSafety] = Clamp(
-            ( frame[kLeft] + frame[kRight] + frame[kWideLeft] + frame[kWideRight] + frame[kBackLeft] + frame[kBackRight] ) / 6.0f,
-            0.0f,
-            1.0f );
-        frame[kEnemyBackProximity] = frame[kEnemyNear] * Clamp( -frame[kEnemyAhead], 0.0f, 1.0f );
-        frame[kSpeedPressure] = Clamp( frame[kSpeed] * frame[kFrontPressure], 0.0f, 1.0f );
-        frame[kEscapeLeft] = Max4( frame[kWideLeft], frame[kLeft], frame[kFrontLeft], frame[kBackLeft] );
-        frame[kEscapeRight] = Max4( frame[kWideRight], frame[kRight], frame[kFrontRight], frame[kBackRight] );
-        frame[kEscapeRouteBias] = Clamp(
-            frame[kEscapeLeft] - frame[kEscapeRight],
-            -1.0f,
-            1.0f );
-
+        TeacherExample example;
+        BuildTeacherExample( cycle, 0, example );
+        bool canLeft = example.canLeft;
+        bool canRight = example.canRight;
         REAL x[kFeatures] = { 0 };
-        BuildStackedFeatures( frame, x );
+        FlattenTeacherExample( example, x );
 
-        REAL h0[kTemporalHidden];
-        REAL h1[kHidden1];
-        REAL h2[kHidden2];
-        REAL h3[kHidden3];
         REAL p[kActions];
         REAL v = 0;
-        int action = Policy::Get().Choose( policyView_, x, canLeft, canRight, h0, h1, h2, h3, p, v );
+        int action = Policy::Get().Choose( policyView_, x, canLeft, canRight, p, v );
         int turn = ActionToTurn( action );
         if ( turn != 0 && cycle->CanMakeTurn( turn ) ) cycle->Turn( turn );
 
@@ -1975,10 +2602,6 @@ protected:
         {
             Step s;
             for ( int i = 0; i < kFeatures; ++i ) s.x[i] = x[i];
-            for ( int i = 0; i < kTemporalHidden; ++i ) s.h0[i] = h0[i];
-            for ( int i = 0; i < kHidden1; ++i ) s.h1[i] = h1[i];
-            for ( int i = 0; i < kHidden2; ++i ) s.h2[i] = h2[i];
-            for ( int i = 0; i < kHidden3; ++i ) s.h3[i] = h3[i];
             for ( int i = 0; i < kActions; ++i ) s.p[i] = p[i];
             s.v = v;
             s.action = action;
@@ -1991,49 +2614,9 @@ protected:
     }
 
 private:
-    void ResetTemporalState()
-    {
-        hasEnemyHistory_ = false;
-        prevEnemyDistance_ = 0;
-        prevEnemySide_ = 0;
-        historyReady_ = false;
-        for ( int frame = 0; frame < kHistoryFrames; ++frame )
-            for ( int feature = 0; feature < kBaseFeatures; ++feature )
-                history_[frame][feature] = 0;
-    }
-
-    void BuildStackedFeatures( REAL const current[kBaseFeatures], REAL stacked[kFeatures] )
-    {
-        if ( !historyReady_ )
-        {
-            for ( int frame = 0; frame < kHistoryFrames; ++frame )
-                for ( int feature = 0; feature < kBaseFeatures; ++feature )
-                    history_[frame][feature] = current[feature];
-            historyReady_ = true;
-        }
-        else
-        {
-            for ( int frame = 0; frame < kHistoryFrames - 1; ++frame )
-                for ( int feature = 0; feature < kBaseFeatures; ++feature )
-                    history_[frame][feature] = history_[frame + 1][feature];
-
-            for ( int feature = 0; feature < kBaseFeatures; ++feature )
-                history_[kHistoryFrames - 1][feature] = current[feature];
-        }
-
-        for ( int frame = 0; frame < kHistoryFrames; ++frame )
-            for ( int feature = 0; feature < kBaseFeatures; ++feature )
-                stacked[frame * kBaseFeatures + feature] = history_[frame][feature];
-    }
-
     std::vector< Step > episode_;
     int policyView_;
     bool trainThisEpisode_;
-    bool hasEnemyHistory_;
-    REAL prevEnemyDistance_;
-    REAL prevEnemySide_;
-    bool historyReady_;
-    REAL history_[kHistoryFrames][kBaseFeatures];
 };
 
 class gTrainedAIFactory : public gSimpleAIFactory
@@ -2066,6 +2649,81 @@ static void OnEnableChanged()
     ApplyFactorySetting();
 }
 
+static void RecordTeacherDecisionImpl( gCycle * cycle, int turn )
+{
+    if ( !sg_record || !cycle || !cycle->Alive() )
+    {
+        return;
+    }
+
+    char const * teacherFile = static_cast< char const * >( sg_teacherFile );
+    if ( !teacherFile || !teacherFile[0] )
+    {
+        return;
+    }
+
+    TeacherEpisodeState & episode = GetTeacherEpisodeState( cycle );
+    int stride = sg_recordStride < 1 ? 1 : sg_recordStride;
+    if ( episode.stepIndex % static_cast< unsigned int >( stride ) != 0 )
+    {
+        ++episode.stepIndex;
+        return;
+    }
+
+    bool canLeft = cycle->CanMakeTurn( -1 );
+    bool canRight = cycle->CanMakeTurn( 1 );
+    if ( turn < 0 && !canLeft )
+    {
+        turn = 0;
+    }
+    if ( turn > 0 && !canRight )
+    {
+        turn = 0;
+    }
+
+    TeacherExample example;
+    BuildTeacherExample( cycle, turn, example );
+
+    std::ofstream out;
+    if ( !tDirectories::Var().Open( out, teacherFile, std::ios::app ) )
+    {
+        return;
+    }
+
+    out.setf( std::ios::fixed );
+    out.precision( 6 );
+    out << "teacher_v1"
+        << " " << episode.episodeId
+        << " " << episode.stepIndex
+        << " " << example.action
+        << " " << ( example.canLeft ? 1 : 0 )
+        << " " << ( example.canRight ? 1 : 0 )
+        << " " << example.halfExtent;
+    for ( int i = 0; i < kTeacherScalarFeatures; ++i )
+    {
+        out << " " << example.scalars[i];
+    }
+    for ( int channel = 0; channel < kTeacherMapChannels; ++channel )
+        for ( int y = 0; y < kTeacherMapSize; ++y )
+            for ( int x = 0; x < kTeacherMapSize; ++x )
+                out << " " << example.map[channel][y][x];
+    out << "\n";
+
+    ++episode.stepIndex;
+}
+
+static void RecordTeacherEpisodeResultImpl( gCycle * cycle, bool survived, REAL distance )
+{
+    (void)survived;
+    (void)distance;
+    if ( !cycle )
+    {
+        return;
+    }
+
+    sg_teacherEpisodes.erase( cycle );
+}
+
 static tConfItem< bool > sg_enableConf( "AI_TRAINED_ENABLE", sg_enable, &OnEnableChanged );
 static tConfItem< bool > sg_learnConf( "AI_TRAINED_LEARN", sg_learn );
 static tConfItem< bool > sg_recordConf( "AI_TRAINED_RECORD", sg_record );
@@ -2073,6 +2731,7 @@ static tConfItem< bool > sg_autostartConf( "AI_TRAINED_AUTOSTART", sg_autostart 
 static tConfItem< int > sg_botCountConf( "AI_TRAINED_BOT_COUNT", sg_botCount );
 static tConfItem< tString > sg_modelFileConf( "AI_TRAINED_MODEL_FILE", sg_modelFile );
 static tConfItem< tString > sg_recordFileConf( "AI_TRAINED_RECORD_FILE", sg_recordFile );
+static tConfItem< tString > sg_teacherFileConf( "AI_TRAINED_TEACHER_FILE", sg_teacherFile );
 static tConfItem< tString > sg_metricsFileConf( "AI_TRAINED_METRICS_FILE", sg_metricsFile );
 static tConfItem< tString > sg_checkpointPrefixConf( "AI_TRAINED_CHECKPOINT_PREFIX", sg_checkpointPrefix );
 static tConfItem< REAL > sg_thinkTimeConf( "AI_TRAINED_THINK_TIME", sg_thinkTime );
@@ -2099,6 +2758,16 @@ static tConfItem< REAL > sg_rewardDeathConf( "AI_TRAINED_REWARD_DEATH", sg_rewar
 static tConfItem< bool > sg_offlineTrainConf( "AI_TRAINED_OFFLINE_TRAIN", sg_offlineTrain );
 static tConfItem< tString > sg_offlineSourceListConf( "AI_TRAINED_OFFLINE_SOURCE_LIST", sg_offlineSourceList );
 static tConfItem< tString > sg_offlineStateFileConf( "AI_TRAINED_OFFLINE_STATE_FILE", sg_offlineStateFile );
+}
+
+void gTrainedAI_RecordTeacherDecision( gCycle * cycle, int turn )
+{
+    RecordTeacherDecisionImpl( cycle, turn );
+}
+
+void gTrainedAI_RecordTeacherEpisodeResult( gCycle * cycle, bool survived, REAL distance )
+{
+    RecordTeacherEpisodeResultImpl( cycle, survived, distance );
 }
 
 bool & gTrainedAI_Enable() { return sg_enable; }

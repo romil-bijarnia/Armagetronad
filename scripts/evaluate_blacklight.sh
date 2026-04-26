@@ -22,15 +22,6 @@ if ! blacklight_preflight_server_bin "${BIN_PATH}"; then
     exit 1
 fi
 
-copy_model_into_var() {
-    local source_path="$1"
-    local target_rel="$2"
-    local target_abs="${REPO_ROOT}/var/${target_rel}"
-    mkdir -p "$(dirname "${target_abs}")"
-    cp "${source_path}" "${target_abs}"
-    printf '%s\n' "${target_rel}"
-}
-
 resolve_default_candidate() {
     if ! blacklight_latest_candidate_model; then
         exit 1
@@ -45,21 +36,27 @@ run_eval_session() {
     local label="$1"
     local model_abs="${2:-}"
     local enable_trained="$3"
+    local wanted_kind="CLASSIC"
 
     local session_rel="${EVAL_ROOT_REL}/${label}"
     local session_abs="${REPO_ROOT}/var/${session_rel}"
     local cfg_rel="generated_eval_${EVAL_ID}_${label}.cfg"
     local cfg_path="${REPO_ROOT}/config/${cfg_rel}"
     local eval_metrics_rel="${session_rel}/ai_eval_metrics.csv"
-    local eval_metrics_summary="${REPO_ROOT}/var/${eval_metrics_rel}.latest"
+    local eval_metrics_abs="${REPO_ROOT}/var/${eval_metrics_rel}"
+    local eval_metrics_summary="${session_abs}/kind_eval_metrics.latest"
     local blacklight_metrics_rel="${session_rel}/blacklight_metrics.csv"
     local server_log="${session_abs}/server.log"
     local model_rel=""
 
+    if [[ "${enable_trained}" == "1" ]]; then
+        wanted_kind="BLACKLIGHT"
+    fi
+
     mkdir -p "${session_abs}"
 
     if [[ -n "${model_abs}" ]]; then
-        model_rel="$(copy_model_into_var "${model_abs}" "${session_rel}/model.txt")"
+        model_rel="$(blacklight_copy_model_into_var "${model_abs}" "${session_rel}/model.txt")"
     fi
 
     cat > "${cfg_path}" <<EOF
@@ -91,11 +88,12 @@ EOF
     kill -TERM "${server_pid}" 2>/dev/null || true
     wait "${server_pid}" || true
 
-    if [[ ! -f "${eval_metrics_summary}" ]]; then
-        echo "Evaluation session ${label} did not produce ${eval_metrics_summary}" >&2
+    if [[ ! -f "${eval_metrics_abs}" ]]; then
+        echo "Evaluation session ${label} did not produce ${eval_metrics_abs}" >&2
         return 1
     fi
 
+    blacklight_write_eval_kind_summary "${eval_metrics_abs}" "${wanted_kind}" "${eval_metrics_summary}"
     printf '%s\n' "${eval_metrics_summary}"
 }
 
@@ -110,10 +108,16 @@ REFERENCE_SOURCE="${2:-}"
 
 if [[ -z "${CANDIDATE_SOURCE}" ]]; then
     CANDIDATE_SOURCE="$(resolve_default_candidate)"
+elif ! CANDIDATE_SOURCE="$(blacklight_resolve_model_input "${CANDIDATE_SOURCE}" 1)"; then
+    echo "Could not resolve evaluation candidate: ${1}" >&2
+    exit 1
 fi
 
 if [[ -z "${REFERENCE_SOURCE}" ]]; then
     REFERENCE_SOURCE="$(resolve_default_reference || true)"
+elif ! REFERENCE_SOURCE="$(blacklight_resolve_model_input "${REFERENCE_SOURCE}" 1)"; then
+    echo "Could not resolve evaluation reference: ${2}" >&2
+    exit 1
 fi
 
 CANDIDATE_SUMMARY="$(run_eval_session candidate "${CANDIDATE_SOURCE}" 1)"
@@ -141,6 +145,25 @@ REPORT_PATH="${EVAL_ROOT_ABS}/report.txt"
         echo "reference_episodes $(read_summary_value "${REFERENCE_SUMMARY}" episodes)"
         echo "reference_win_rate $(read_summary_value "${REFERENCE_SUMMARY}" win_rate)"
         echo "reference_average_distance $(read_summary_value "${REFERENCE_SUMMARY}" average_distance)"
+        awk '
+            $1 == "candidate_win_rate" { candidate_win = $2 }
+            $1 == "candidate_average_distance" { candidate_distance = $2 }
+            $1 == "reference_win_rate" { reference_win = $2 }
+            $1 == "reference_average_distance" { reference_distance = $2 }
+            END {
+                printf "delta_win_rate %.6f\n", candidate_win - reference_win
+                if (reference_distance > 0) {
+                    printf "distance_ratio %.6f\n", candidate_distance / reference_distance
+                } else {
+                    printf "distance_ratio 0.000000\n"
+                }
+            }
+        ' <(
+            echo "candidate_win_rate $(read_summary_value "${CANDIDATE_SUMMARY}" win_rate)"
+            echo "candidate_average_distance $(read_summary_value "${CANDIDATE_SUMMARY}" average_distance)"
+            echo "reference_win_rate $(read_summary_value "${REFERENCE_SUMMARY}" win_rate)"
+            echo "reference_average_distance $(read_summary_value "${REFERENCE_SUMMARY}" average_distance)"
+        )
     fi
     echo
     echo "classic_kind $(read_summary_value "${CLASSIC_SUMMARY}" kind)"

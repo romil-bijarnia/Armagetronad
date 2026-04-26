@@ -130,15 +130,6 @@ fi
 
 mkdir -p "${BENCH_ROOT_ABS}"
 
-copy_model_into_var() {
-    local source_path="$1"
-    local target_rel="$2"
-    local target_abs="${REPO_ROOT}/var/${target_rel}"
-    mkdir -p "$(dirname "${target_abs}")"
-    cp "${source_path}" "${target_abs}"
-    printf '%s\n' "${target_rel}"
-}
-
 run_benchmark_session() {
     local label="$1"
     local session_index="$2"
@@ -148,15 +139,16 @@ run_benchmark_session() {
     local cfg_rel="generated_bench_${BENCH_ID}_${label}_$(printf '%02d' "${session_index}").cfg"
     local cfg_path="${REPO_ROOT}/config/${cfg_rel}"
     local eval_metrics_rel="${session_rel}/ai_eval_metrics.csv"
-    local eval_metrics_summary="${REPO_ROOT}/var/${eval_metrics_rel}.latest"
+    local eval_metrics_abs="${REPO_ROOT}/var/${eval_metrics_rel}"
+    local eval_metrics_summary="${session_abs}/blacklight_eval_metrics.latest"
     local blacklight_metrics_rel="${session_rel}/blacklight_metrics.csv"
     local server_log="${session_abs}/server.log"
     local model_rel=""
     local deadline=0
-    local summary_episodes=0
+    local blacklight_episodes=0
 
     mkdir -p "${session_abs}"
-    model_rel="$(copy_model_into_var "${model_abs}" "${session_rel}/model.txt")"
+    model_rel="$(blacklight_copy_model_into_var "${model_abs}" "${session_rel}/model.txt")"
 
     cat > "${cfg_path}" <<EOF
 SINCLUDE ${BASE_CFG_REL}
@@ -189,9 +181,9 @@ EOF
     deadline=$(( $(date +%s) + BENCH_DURATION_SECONDS ))
 
     while kill -0 "${server_pid}" 2>/dev/null; do
-        if [[ -f "${eval_metrics_summary}" ]]; then
-            summary_episodes="$(blacklight_read_summary_value "${eval_metrics_summary}" episodes)"
-            if [[ "${summary_episodes:-0}" =~ ^[0-9]+$ ]] && (( summary_episodes >= BENCH_LIMIT_ROUNDS )); then
+        if [[ -f "${eval_metrics_abs}" ]]; then
+            blacklight_episodes="$(blacklight_eval_metrics_episodes "${eval_metrics_abs}" "BLACKLIGHT")"
+            if [[ "${blacklight_episodes:-0}" =~ ^[0-9]+$ ]] && (( blacklight_episodes >= BENCH_LIMIT_ROUNDS )); then
                 break
             fi
         fi
@@ -205,11 +197,12 @@ EOF
     kill -TERM "${server_pid}" 2>/dev/null || true
     wait "${server_pid}" 2>/dev/null || true
 
-    if [[ ! -f "${eval_metrics_summary}" ]]; then
-        echo "Benchmark session ${label}/$(printf '%02d' "${session_index}") did not produce ${eval_metrics_summary}" >&2
+    if [[ ! -f "${eval_metrics_abs}" ]]; then
+        echo "Benchmark session ${label}/$(printf '%02d' "${session_index}") did not produce ${eval_metrics_abs}" >&2
         return 1
     fi
 
+    blacklight_write_eval_kind_summary "${eval_metrics_abs}" "BLACKLIGHT" "${eval_metrics_summary}"
     printf '%s\n' "${eval_metrics_summary}"
 }
 

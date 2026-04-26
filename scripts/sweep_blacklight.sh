@@ -51,7 +51,8 @@ declare -a MIXED_RUNS=()
 declare -a BOOTSTRAP_REPORTS=()
 declare -a HARDENING_REPORTS=()
 declare -a MIXED_REPORTS=()
-declare -A CANDIDATE_MANIFESTS=()
+CANDIDATE_MAP_PATH="${SWEEP_DIR_ABS}/candidate_manifest_map.txt"
+: > "${CANDIDATE_MAP_PATH}"
 
 run_training_stage() {
     local profile="$1"
@@ -86,6 +87,17 @@ benchmark_candidate_model() {
     printf '%s\n' "${report_path}"
 }
 
+record_candidate_manifest() {
+    local candidate_model="$1"
+    local manifest_path="$2"
+    printf '%s|%s\n' "${candidate_model}" "${manifest_path}" >> "${CANDIDATE_MAP_PATH}"
+}
+
+manifest_for_candidate() {
+    local candidate_model="$1"
+    awk -F'|' -v wanted="${candidate_model}" '$1 == wanted { print $2; exit }' "${CANDIDATE_MAP_PATH}"
+}
+
 collect_stage_candidates() {
     local manifest_path="$1"
     local report_array_name="$2"
@@ -94,7 +106,7 @@ collect_stage_candidates() {
 
     while IFS= read -r candidate_model; do
         [[ -n "${candidate_model}" ]] || continue
-        CANDIDATE_MANIFESTS["${candidate_model}"]="${manifest_path}"
+        record_candidate_manifest "${candidate_model}" "${manifest_path}"
         bench_report="$(benchmark_candidate_model "${candidate_model}")"
         eval "${report_array_name}+=(\"\${bench_report}\")"
     done < <(blacklight_checkpoint_candidates_for_input "${manifest_path}" 3)
@@ -115,9 +127,10 @@ for manifest_path in "${BOOTSTRAP_RUNS[@]}"; do
 done
 
 IFS='|' read -r BOOTSTRAP_BEST_REPORT BOOTSTRAP_BEST_MODEL < <(best_model_from_reports "${BOOTSTRAP_REPORTS[@]}")
-if [[ -n "${CANDIDATE_MANIFESTS[${BOOTSTRAP_BEST_MODEL}]:-}" ]]; then
-    blacklight_env_set "${CANDIDATE_MANIFESTS[${BOOTSTRAP_BEST_MODEL}]}" "CHOSEN_CHECKPOINT_ABS" "${BOOTSTRAP_BEST_MODEL}"
-    blacklight_env_set "${CANDIDATE_MANIFESTS[${BOOTSTRAP_BEST_MODEL}]}" "BENCH_REPORT_ABS" "${BOOTSTRAP_BEST_REPORT}"
+BOOTSTRAP_BEST_MANIFEST="$(manifest_for_candidate "${BOOTSTRAP_BEST_MODEL}")"
+if [[ -n "${BOOTSTRAP_BEST_MANIFEST}" ]]; then
+    blacklight_env_set "${BOOTSTRAP_BEST_MANIFEST}" "CHOSEN_CHECKPOINT_ABS" "${BOOTSTRAP_BEST_MODEL}"
+    blacklight_env_set "${BOOTSTRAP_BEST_MANIFEST}" "BENCH_REPORT_ABS" "${BOOTSTRAP_BEST_REPORT}"
 fi
 
 for (( i = 1; i <= HARDENING_REPLICATES; ++i )); do
@@ -129,9 +142,10 @@ for manifest_path in "${HARDENING_RUNS[@]}"; do
 done
 
 IFS='|' read -r HARDENING_BEST_REPORT HARDENING_BEST_MODEL < <(best_model_from_reports "${HARDENING_REPORTS[@]}")
-if [[ -n "${CANDIDATE_MANIFESTS[${HARDENING_BEST_MODEL}]:-}" ]]; then
-    blacklight_env_set "${CANDIDATE_MANIFESTS[${HARDENING_BEST_MODEL}]}" "CHOSEN_CHECKPOINT_ABS" "${HARDENING_BEST_MODEL}"
-    blacklight_env_set "${CANDIDATE_MANIFESTS[${HARDENING_BEST_MODEL}]}" "BENCH_REPORT_ABS" "${HARDENING_BEST_REPORT}"
+HARDENING_BEST_MANIFEST="$(manifest_for_candidate "${HARDENING_BEST_MODEL}")"
+if [[ -n "${HARDENING_BEST_MANIFEST}" ]]; then
+    blacklight_env_set "${HARDENING_BEST_MANIFEST}" "CHOSEN_CHECKPOINT_ABS" "${HARDENING_BEST_MODEL}"
+    blacklight_env_set "${HARDENING_BEST_MANIFEST}" "BENCH_REPORT_ABS" "${HARDENING_BEST_REPORT}"
 fi
 
 for (( i = 1; i <= MIXED_REPLICATES; ++i )); do
@@ -143,9 +157,10 @@ for manifest_path in "${MIXED_RUNS[@]}"; do
 done
 
 IFS='|' read -r FINAL_BEST_REPORT FINAL_BEST_MODEL < <(best_model_from_reports "${MIXED_REPORTS[@]}")
-if [[ -n "${CANDIDATE_MANIFESTS[${FINAL_BEST_MODEL}]:-}" ]]; then
-    blacklight_env_set "${CANDIDATE_MANIFESTS[${FINAL_BEST_MODEL}]}" "CHOSEN_CHECKPOINT_ABS" "${FINAL_BEST_MODEL}"
-    blacklight_env_set "${CANDIDATE_MANIFESTS[${FINAL_BEST_MODEL}]}" "BENCH_REPORT_ABS" "${FINAL_BEST_REPORT}"
+FINAL_BEST_MANIFEST="$(manifest_for_candidate "${FINAL_BEST_MODEL}")"
+if [[ -n "${FINAL_BEST_MANIFEST}" ]]; then
+    blacklight_env_set "${FINAL_BEST_MANIFEST}" "CHOSEN_CHECKPOINT_ABS" "${FINAL_BEST_MODEL}"
+    blacklight_env_set "${FINAL_BEST_MANIFEST}" "BENCH_REPORT_ABS" "${FINAL_BEST_REPORT}"
 fi
 
 PROMOTION_OUTPUT="$("${SCRIPT_DIR}/promote_blacklight.sh" --candidate "${FINAL_BEST_MODEL}")"

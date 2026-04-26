@@ -42,6 +42,7 @@ Makefile
 /extrapaths
 /stamp-h1
 /config/generated_blacklight_*.cfg
+/config/generated_bench_*.cfg
 /config/generated_eval_*.cfg
 /universal_variable*
 batch/relocate
@@ -80,6 +81,7 @@ src/protobuf/.dir
 /armagetronad
 /armagetronad-dedicated
 /var
+var/blacklight_vast/
 src/test/chat_prefix_test
 leak.log
 memprofile1.txt

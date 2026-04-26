@@ -98,6 +98,7 @@ ARMAGETRON_SELFPLAY_CHECKPOINT_EVERY=1 \
 "${SCRIPT_DIR}/blacklight.sh" train \
     --profile classic_bootstrap \
     --name "${BOOTSTRAP_RUN}" \
+    --checkpoint-every 1 \
     --parallel-workers 2 \
     --sync-seconds 40 \
     --duration 90
@@ -123,8 +124,12 @@ assert_contains "${BOOTSTRAP_WORKER_CFG}" "AI_TRAINED_BOT_COUNT 1"
 assert_contains "${BOOTSTRAP_WORKER_CFG}" "AI_TRAINED_POLICY_POOL_SIZE 0"
 assert_contains "${BOOTSTRAP_WORKER_CFG}" "AI_TRAINED_POLICY_HISTORIC_PROB 0"
 
-mapfile -t BOOTSTRAP_CANDIDATES < <(blacklight_checkpoint_candidates_for_input "${BOOTSTRAP_MANIFEST}" 3)
-(( ${#BOOTSTRAP_CANDIDATES[@]} >= 2 )) || fail "Expected final model plus at least one checkpoint candidate"
+BOOTSTRAP_CANDIDATE_COUNT=0
+while IFS= read -r bootstrap_candidate; do
+    [[ -n "${bootstrap_candidate}" ]] || continue
+    BOOTSTRAP_CANDIDATE_COUNT=$(( BOOTSTRAP_CANDIDATE_COUNT + 1 ))
+done < <(blacklight_checkpoint_candidates_for_input "${BOOTSTRAP_MANIFEST}" 3)
+(( BOOTSTRAP_CANDIDATE_COUNT >= 2 )) || fail "Expected final model plus at least one checkpoint candidate"
 
 echo "Running benchmark smoke and champion default-reference check..."
 

@@ -217,7 +217,6 @@ gSimpleAIFactory *gSimpleAIFactory::factory_ = NULL;
 
 gSimpleAI::~gSimpleAI()
 {
-    con << "simple AI destroyed.\n";
 }
 
 gSimpleAI * gSimpleAIFactory::Create( gCycle * object ) const
@@ -1324,6 +1323,7 @@ gAIPlayer::gAIPlayer( Game::AIPlayerSync const & sync, nSenderInfo const & sende
         ePlayerNetID(sync.base(), sender ),
         simpleAI_(NULL),
         useSimpleAI_(false),
+        roundUsesSimpleAI_(false),
         simpleAIResultReported_(false),
         aiEvalResultReported_(false),
         hasLastObjectState_( false ),
@@ -1343,6 +1343,7 @@ gAIPlayer::gAIPlayer( Game::AIPlayerSync const & sync, nSenderInfo const & sende
 gAIPlayer::gAIPlayer():
         simpleAI_(NULL),
         useSimpleAI_(false),
+        roundUsesSimpleAI_(false),
         simpleAIResultReported_(false),
         aiEvalResultReported_(false),
         hasLastObjectState_( false ),
@@ -1470,12 +1471,18 @@ void gAIPlayer::ControlObject( eNetGameObject * c )
     }
     if ( !aiEvalResultReported_ )
     {
-        sg_ReportAIEpisode( useSimpleAI_, survived, distance );
+        sg_ReportAIEpisode( roundUsesSimpleAI_, survived, distance );
         aiEvalResultReported_ = true;
+    }
+    if ( !roundUsesSimpleAI_ && Object() )
+    {
+        gTrainedAI_RecordTeacherEpisodeResult( Object(), survived, distance );
     }
 
     ePlayerNetID::ControlObject( c );
+    delete simpleAI_;
     simpleAI_ = NULL;
+    roundUsesSimpleAI_ = false;
     simpleAIResultReported_ = false;
     aiEvalResultReported_ = false;
     hasLastObjectState_ = false;
@@ -1500,12 +1507,18 @@ void gAIPlayer::ClearObject()
     }
     if ( !aiEvalResultReported_ )
     {
-        sg_ReportAIEpisode( useSimpleAI_, survived, distance );
+        sg_ReportAIEpisode( roundUsesSimpleAI_, survived, distance );
         aiEvalResultReported_ = true;
+    }
+    if ( !roundUsesSimpleAI_ && Object() )
+    {
+        gTrainedAI_RecordTeacherEpisodeResult( Object(), survived, distance );
     }
 
     ePlayerNetID::ClearObject();
+    delete simpleAI_;
     simpleAI_ = NULL;
+    roundUsesSimpleAI_ = false;
     simpleAIResultReported_ = false;
     aiEvalResultReported_ = false;
     hasLastObjectState_ = false;
@@ -3031,7 +3044,7 @@ void gAIPlayer::RightBeforeDeath(int triesLeft) // is called right before the ve
 
     if ( !aiEvalResultReported_ )
     {
-        sg_ReportAIEpisode( useSimpleAI_, false, distance );
+        sg_ReportAIEpisode( roundUsesSimpleAI_, false, distance );
         aiEvalResultReported_ = true;
     }
 
@@ -3216,12 +3229,16 @@ REAL gAIPlayer::Think(){
         if ( factory )
         {
             simpleAI_ = factory->Create( Object() );
+            roundUsesSimpleAI_ = simpleAI_ != NULL;
             simpleAIResultReported_ = false;
         }
     }
 
+    // Once a simple controller has claimed the round, keep it in charge until
+    // teardown so live config toggles don't create mixed-controller episodes.
     if ( simpleAI_ )
     {
+        roundUsesSimpleAI_ = true;
         return simpleAI_->Think();
     }
 
@@ -3426,6 +3443,16 @@ void gAIPlayer::ActOnData( ThinkDataBase & data )
         }
     }
     tRecorder::Record( section, data );
+
+    if ( Object() && Object()->Alive() )
+    {
+        int recordedTurn = data.turn;
+        if ( recordedTurn && !Object()->CanMakeTurn( recordedTurn ) )
+        {
+            recordedTurn = 0;
+        }
+        gTrainedAI_RecordTeacherDecision( Object(), recordedTurn );
+    }
 
     // execute turn
     if ( data.turn )
